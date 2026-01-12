@@ -5,27 +5,19 @@
 #include <cuda.h>
 #include <cuda/barrier>
 
-// =============================================================================
-// CONSTANTS
-// =============================================================================
-
 // We want to launch 148 blocks and have those persistently running on the B200
 // A kernel is executed as a grid of blocks of threads
 // Each CUDA block is executed by one streaming multiprocessor (SM)
 
 // Tile sizes for our matmul
-constexpr int TILE_M = 128;  // Tile size for M dimension (rows of A, rows of C)
-constexpr int TILE_N = 256;  // Tile size for N dimension (cols of B, cols of C)
-constexpr int TILE_K = 64;   // Tile size for K dimension (cols of A, rows of B)
+constexpr int TILE_M = 128;  
+constexpr int TILE_N = 256;  
+constexpr int TILE_K = 64;   
 
-constexpr int NUM_CONSUMERS = 1;
+constexpr int NUM_CONSUMERS = 1; // Pipelining not implemented :(
 constexpr int NUM_PRODUCERS = 1;
 constexpr int NUM_WORKERS = (NUM_CONSUMERS + NUM_PRODUCERS) * 4;  // 4 warps per warpgroup
 constexpr int NUM_THREADS = NUM_WORKERS * 32;  // 32 threads per warp = 256 threads
-
-// =============================================================================
-// KERNEL
-// =============================================================================
 
 __global__ void my_matmul_kernel(
     const __grid_constant__ CUtensorMap tensor_map_A,  // TMA descriptor for A
@@ -75,8 +67,15 @@ __global__ void my_matmul_kernel(
         int tile_col = tile_id % num_tiles_n; 
 
         // Essentially now we're looping through all the partitions of A0B0 + A1B1 + ... To make
-        // The current tile at C that we want to calculate and accumulating the partial sum. 
-        float accumulator = 0.0f
+        // The current tile at C that we want to calculate and accumulating the partial sum.
+
+        // Each thread computes one element of the output tile (simplified version)
+        // For full tile: would need 128*256 = 32768 elements, but we only have 256 threads
+        // So each thread handles one element in a 16x16 sub-tile for now
+        int local_row = threadIdx.x / 16;   // 0-15 (which row within our small output)
+        int local_col = threadIdx.x % 16;   // 0-15 (which col within our small output)
+        float accumulator = 0.0f;
+
         for (int k_tile = 0; k_tile < num_k_tiles; k_tile++) {
 
             if (wg_id == 0) {
@@ -132,6 +131,7 @@ __global__ void my_matmul_kernel(
             }
             else {
                 // --- CONSUMER ROLE ---
+                // Ideally this should do something
              
             }
 
@@ -162,7 +162,7 @@ Questions:
 */
 
 // =============================================================================
-// HELPER: Create TMA descriptor
+// HELPER: Create TMA descriptor (TODO: Learn more about how this works...)
 // =============================================================================
 
 CUtensorMap create_tensor_map(
@@ -230,10 +230,8 @@ int main() {
     std::cout << "Matrix dimensions: M=" << M << ", N=" << N << ", K=" << K << std::endl;
     std::cout << "Tile sizes: TILE_M=" << TILE_M << ", TILE_N=" << TILE_N << ", TILE_K=" << TILE_K << std::endl;
 
-    // =========================================================================
-    // Step 1: Allocate memory on CPU (Host)
-    // =========================================================================
-    // "h_" prefix means "host" (CPU)
+    //   Allocate memory on CPU (Host)
+
 
     float* h_A = new float[M * K];
     float* h_B = new float[K * N];
@@ -241,11 +239,11 @@ int main() {
 
     std::cout << "Allocated host memory" << std::endl;
 
-    // =========================================================================
-    // Step 2: Initialize matrices with random values
-    // =========================================================================
+  
+    // Initialize matrices with random values
+  
 
-    std::mt19937 gen(42);  // Fixed seed for reproducibility
+    std::mt19937 gen(42);  
     std::uniform_real_distribution<float> dis(-0.5f, 0.5f);
 
     for (int i = 0; i < M * K; i++) h_A[i] = dis(gen);
@@ -253,9 +251,9 @@ int main() {
 
     std::cout << "Initialized matrices with random values" << std::endl;
 
-    // =========================================================================
-    // Step 3: Allocate memory on GPU (Device)
-    // =========================================================================
+
+    // Allocate memory on GPU (Device)
+
     // "d_" prefix means "device" (GPU)
     // cudaMalloc allocates memory in GPU's global memory (HBM)
 
@@ -305,10 +303,7 @@ int main() {
     CUtensorMap tensor_map_B = create_tensor_map(d_B, K, N, TILE_K, TILE_N);
     std::cout << "Created TMA descriptor for B" << std::endl;
 
-    // =========================================================================
-    // Step 6: Launch the kernel
-    // =========================================================================
-
+    // launch kernel
     dim3 grid(148, 1);       // 148 blocks (one per SM on B200)
     dim3 block(NUM_THREADS); // 256 threads per block (2 warpgroups)
 
@@ -318,7 +313,6 @@ int main() {
     std::cout << "  - " << block.x / 32 << " warps per block" << std::endl;
     std::cout << "  - " << block.x / 128 << " warpgroups per block" << std::endl;
 
-    // Launch! The <<<grid, block>>> syntax is CUDA-specific
     // Now passing TMA descriptors instead of raw pointers for A and B
     my_matmul_kernel<<<grid, block>>>(tensor_map_A, tensor_map_B, d_C, M, N, K);
 
@@ -334,10 +328,7 @@ int main() {
 
     std::cout << "Kernel finished!" << std::endl;
 
-    // =========================================================================
-    // Step 7: Copy result GPU → CPU
-    // =========================================================================
-
+    // Copy result
     __nv_bfloat16* h_C_bf16 = new __nv_bfloat16[M * N];
 
     // cudaMemcpyDeviceToHost = GPU → CPU
@@ -348,9 +339,6 @@ int main() {
 
     std::cout << "Copied result back to host" << std::endl;
 
-    // =========================================================================
-    // Step 8: Clean up
-    // =========================================================================
 
     // Free GPU memory
     cudaFree(d_A);
