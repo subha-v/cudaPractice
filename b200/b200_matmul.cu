@@ -53,13 +53,13 @@ __global__ void my_matmul_kernel(
 
     // Initialize the barrier (only one thread does this)
     if (threadIdx.x == 0) {
-        // Initialize barrier with expected arrival count
-        // We expect 1 thread to arrive (the one triggering TMA) + TMA transaction count
-        init(&tma_barrier, 1);
+        init(&tma_barrier, 1); // This sets up a barrier/semaphore for later
+        // Which tells us that 1 thread is expected to arrive
+        // Per block
     }
     __syncthreads();  // Make sure barrier is initialized before anyone uses it
 
-    // Calculate how many output tiles we have
+    // Calculate how many output tiles we have in C
     int num_tiles_m = M / TILE_M;
     int num_tiles_n = N / TILE_N;
     int num_k_tiles = K / TILE_K;
@@ -70,11 +70,13 @@ __global__ void my_matmul_kernel(
     // We stride by gridDim.x (148) so all blocks divide up the work
     for (int tile_id = blockIdx.x; tile_id < total_tiles; tile_id += gridDim.x) {
 
-        // Convert linear tile_id to 2D tile coordinates
-        int tile_row = tile_id / num_tiles_n;  // Which row of output tiles
-        int tile_col = tile_id % num_tiles_n;  // Which col of output tiles
+        // Convert tile_id to 2D tile coordinates of where in C It is 
+        int tile_row = tile_id / num_tiles_n;  
+        int tile_col = tile_id % num_tiles_n; 
 
-        // Loop over K dimension - accumulate partial results
+        // Essentially now we're looping through all the partitions of A0B0 + A1B1 + ... To make
+        // The current tile at C that we want to calculate and accumulating the partial sum. 
+        float accumulator = 0.0f
         for (int k_tile = 0; k_tile < num_k_tiles; k_tile++) {
 
             if (wg_id == 0) {
@@ -125,28 +127,30 @@ __global__ void my_matmul_kernel(
                     );
                 }
 
-                // 3. Arrive at barrier (producer threads wait for TMA to complete)
+                // Once this code executes, it signals the barrier automatically 
+
             }
             else {
                 // --- CONSUMER ROLE ---
-                // 1. Wait at the Barrier for data.
-                // 2. Use WGMMA to compute matrix multiply.
-                // 3. Signal Producer when Smem is free.
+             
             }
 
             // All threads wait for TMA loads to complete
             // The barrier will be released when TMA has delivered all expected bytes
             tma_barrier.arrive_and_wait();
 
-            // === At this point, a_smem and b_smem contain the loaded tiles ===
-
-            // TODO: Consumer performs WGMMA here
+            for (int k = 0; k < TILE_K; k++){ 
+                accumulator += __bfloat162float(a_smem[local_row * TILE_K + k]) * 
+                __bfloat162float(b_smem[k * TILE_N + local_col]);
+            }
 
             // Sync before next iteration (so we don't overwrite smem while someone reads)
             __syncthreads();
         }
 
-        // TODO: Store accumulated result to C
+        int global_row = tile_row * TILE_M + local_row;
+        int global_col = tile_col * TILE_N + local_col; 
+        C[global_row * N + global_col] = __float2bfloat16(accumulator); //  Store accumulated result to C
     }
 }
 
