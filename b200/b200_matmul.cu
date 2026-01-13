@@ -134,6 +134,7 @@ __global__ void my_matmul_kernel(
     // TMEM allocation - tcgen05.alloc is a COLLECTIVE operation
     // All threads must execute it together (.sync.aligned)
     if (threadIdx.x == 0 && blockIdx.x == 0) printf("[DEBUG] Block 0: All threads allocating TMEM\n");
+    __syncthreads();  // IMPORTANT: Reconverge after printf before collective op
 
     uint32_t num_cols = TMEM_COLS;
     uint32_t tmem_base_smem_addr = __cvta_generic_to_shared(&tmem_base);
@@ -146,7 +147,6 @@ __global__ void my_matmul_kernel(
     __syncthreads();  // Ensure all threads see the allocated tmem_base
 
     if (threadIdx.x == 0 && blockIdx.x == 0) printf("[DEBUG] Block 0: TMEM allocated, tmem_base=%u\n", tmem_base);
-    if (threadIdx.x == 0 && blockIdx.x == 0) printf("[DEBUG] Block 0: Past TMEM alloc syncthreads\n");
 
     int num_tiles_m = M / TILE_M;
     int num_tiles_n = N / TILE_N;
@@ -376,6 +376,7 @@ __global__ void my_matmul_kernel(
     // deallocate tmem - tcgen05.dealloc is also a COLLECTIVE operation
     __syncthreads();  // Ensure all threads are done before dealloc
     if (threadIdx.x == 0 && blockIdx.x == 0) printf("[DEBUG] Block 0: All threads deallocating TMEM\n");
+    __syncthreads();  // Reconverge after printf before collective op
 
     uint32_t dealloc_num_cols = TMEM_COLS;
     asm volatile(
