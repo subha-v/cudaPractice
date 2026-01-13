@@ -113,6 +113,8 @@ __global__ void my_matmul_kernel(
 
     // initialization
     if (threadIdx.x == 0) {
+        if (blockIdx.x == 0) printf("[DEBUG] Block 0: Starting barrier init\n");
+
         // Initialize barriers using PTX mbarrier.init
         for (int i = 0; i < PIPE_DEPTH; i++) {
             uint64_t* arrived_ptr = &inputs_arrived_storage[i];
@@ -127,6 +129,8 @@ __global__ void my_matmul_kernel(
             );
         }
 
+        if (blockIdx.x == 0) printf("[DEBUG] Block 0: Barriers initialized, allocating TMEM\n");
+
         // allocates TMEM for 128x256 float accumulator (256 columns of 512 bytes each)
         // tcgen05.alloc writes the TMEM address to shared memory at [dst]
         uint32_t num_cols = TMEM_COLS;
@@ -137,8 +141,12 @@ __global__ void my_matmul_kernel(
             : "r"(tmem_base_smem_addr), "r"(num_cols)
             : "memory"
         );
+
+        if (blockIdx.x == 0) printf("[DEBUG] Block 0: TMEM allocated, tmem_base=%u\n", tmem_base);
     }
     __syncthreads();
+
+    if (threadIdx.x == 0 && blockIdx.x == 0) printf("[DEBUG] Block 0: Past first syncthreads\n");
 
     int num_tiles_m = M / TILE_M;
     int num_tiles_n = N / TILE_N;
@@ -158,6 +166,7 @@ __global__ void my_matmul_kernel(
 
         // 1 thread of the producer loads the first tiles
         if (wg_id == 1 && threadIdx.x == 128) {  // First thread of producer warpgroup
+            if (blockIdx.x == 0 && tile_id == 0) printf("[DEBUG] Block 0: Producer starting prefetch\n");
             int prefetch_count = min(PIPE_DEPTH, num_k_tiles); // min (4, tiles) = 4 usually
             for (int k_tile = 0; k_tile < prefetch_count; k_tile++) {
                 int slot = k_tile % PIPE_DEPTH;
@@ -168,7 +177,10 @@ __global__ void my_matmul_kernel(
                     &tensor_map_A, &tensor_map_B
                 );
             }
+            if (blockIdx.x == 0 && tile_id == 0) printf("[DEBUG] Block 0: Producer prefetch done\n");
         }
+        if (threadIdx.x == 0 && blockIdx.x == 0 && tile_id == 0) printf("[DEBUG] Block 0: Entering k_tile loop, num_k_tiles=%d\n", num_k_tiles);
+
         // we split up the tiles of  A and B into further tiles
         // note that each tile of A is 128 x 64 and each tile of B is 64 x 256, where K = 64 (we just set that lol)
         for (int k_tile = 0; k_tile < num_k_tiles; k_tile++) { // i think we have like 32 k tiles for 1024 x 1024
@@ -176,18 +188,24 @@ __global__ void my_matmul_kernel(
             int load_k_tile = k_tile + PIPE_DEPTH; // which one to load for the producer
             int load_slot = load_k_tile % PIPE_DEPTH; // which slot to load it into
 
+            if (threadIdx.x == 0 && blockIdx.x == 0 && tile_id == 0 && k_tile < 3) printf("[DEBUG] Block 0: k_tile=%d, compute_slot=%d\n", k_tile, compute_slot);
+
             // consumer thread executes wgmma
             if (wg_id == 0) {
                 // Consumer waits for the producer (only thread 0 does the barrier wait)
                 if (threadIdx.x == 0) {
+                    if (blockIdx.x == 0 && k_tile == 0) printf("[DEBUG] Block 0: Consumer waiting on barrier (k_tile=%d)\n", k_tile);
                     inputs_arrived[compute_slot].arrive_and_wait();
+                    if (blockIdx.x == 0 && k_tile == 0) printf("[DEBUG] Block 0: Consumer past barrier (k_tile=%d)\n", k_tile);
                 }
                 // at this point, only thread 0 does the barrier wait
                 // threads 1-127 in the consumer warpgroup dont know yet
                 // Warpgroup fence ensures all consumer threads see the data
 
                 // Fence before tcgen05 operations to ensure memory ordering
-                asm volatile("tcgen05.fence::before_thread_sync;"); 
+                asm volatile("tcgen05.fence::before_thread_sync;");
+
+                if (threadIdx.x == 0 && blockIdx.x == 0 && k_tile == 0) printf("[DEBUG] Block 0: Past tcgen05.fence (k_tile=%d)\n", k_tile); 
                 
                 // Get shared memory addresses for current slot
                 uint32_t a_addr = __cvta_generic_to_shared(a_smem[compute_slot]);
@@ -207,6 +225,8 @@ __global__ void my_matmul_kernel(
                 // tcgen05.mma for 128x256 output tile with K=64
                 // Each tcgen05.mma handles 128 rows, 256 cols, 16 k-elements
                 // 4 k-steps needed (TILE_K=64, step=16)
+
+                if (threadIdx.x == 0 && blockIdx.x == 0 && k_tile == 0) printf("[DEBUG] Block 0: Starting tcgen05.mma loop\n");
 
                 #pragma unroll
                 for (int k_step = 0; k_step < TILE_K; k_step += 16) { // K = 64
@@ -228,9 +248,15 @@ __global__ void my_matmul_kernel(
                     uint64_t b_desc = ((uint64_t)((b_smem_addr >> 4) & 0x3FFF)) |
                                       ((uint64_t)(((TILE_K * 2) >> 4) & 0x3FFF) << 16);
 
+                    if (threadIdx.x == 0 && blockIdx.x == 0 && k_tile == 0 && k_step == 0) {
+                        printf("[DEBUG] Block 0: tcgen05.mma params: tmem_base=%u, a_desc=0x%llx, b_desc=0x%llx, idesc=0x%x\n",
+                               tmem_base, (unsigned long long)a_desc, (unsigned long long)b_desc, idesc);
+                    }
+
                     // enable_input_d: 0 = D = A*B (no accum), 1 = D = A*B + D (accum)
                     // First iteration zeros accumulator, rest accumulate
                     if (k_tile == 0 && k_step == 0) {
+                        if (threadIdx.x == 0 && blockIdx.x == 0) printf("[DEBUG] Block 0: Calling tcgen05.mma (first, no accum)\n");
                         // D = A*B (enable_d = 0, no accumulation)
                         asm volatile(
                             "tcgen05.mma.cta_group::1.kind::f16 [%0], %1, %2, %3, 0;"
@@ -238,6 +264,7 @@ __global__ void my_matmul_kernel(
                             : "r"(tmem_base), "l"(a_desc), "l"(b_desc), "r"(idesc)
                             : "memory"
                         );
+                        if (threadIdx.x == 0 && blockIdx.x == 0) printf("[DEBUG] Block 0: tcgen05.mma returned (first)\n");
                     } else {
                         // D = A*B + D (enable_d = 1, accumulate)
                         asm volatile(
@@ -248,6 +275,8 @@ __global__ void my_matmul_kernel(
                         );
                     }
                 }
+
+                if (threadIdx.x == 0 && blockIdx.x == 0 && k_tile == 0) printf("[DEBUG] Block 0: Finished tcgen05.mma loop for k_tile=0\n");
 
                 // Wait for all MMA operations to complete
                 // TODO: For proper async completion, use tcgen05.commit + mbarrier pattern
@@ -280,6 +309,8 @@ __global__ void my_matmul_kernel(
         // store results from TMEM to global memory
         // Consumer warpgroup reads from TMEM and writes directly to global memory
         if (wg_id == 0) {
+            if (threadIdx.x == 0 && blockIdx.x == 0 && tile_id == 0) printf("[DEBUG] Block 0: Starting store phase\n");
+
             // Fence to ensure MMA completion before reading
             asm volatile("tcgen05.fence::before_thread_sync;");
 
@@ -292,11 +323,17 @@ __global__ void my_matmul_kernel(
             int lane_id = threadIdx.x % 32;           // 0-31 within warp
             int cols_per_warp = TMEM_COLS / 4;        // 64 columns per warp
 
+            if (threadIdx.x == 0 && blockIdx.x == 0 && tile_id == 0) printf("[DEBUG] Block 0: Starting tcgen05.ld loop\n");
+
             for (int col_idx = 0; col_idx < cols_per_warp; col_idx++) {
                 int col = warp_in_consumer * cols_per_warp + col_idx;
 
                 // All threads in warp use the SAME taddr (base of this column)
                 uint32_t taddr = tmem_base + col * 512;  // 512 bytes per column
+
+                if (threadIdx.x == 0 && blockIdx.x == 0 && tile_id == 0 && col_idx == 0) {
+                    printf("[DEBUG] Block 0: tcgen05.ld taddr=%u (col=%d)\n", taddr, col);
+                }
 
                 // Collective load: each thread receives 4 floats from the column
                 float r0, r1, r2, r3;
@@ -305,6 +342,10 @@ __global__ void my_matmul_kernel(
                     : "=f"(r0), "=f"(r1), "=f"(r2), "=f"(r3)
                     : "r"(taddr)
                 );
+
+                if (threadIdx.x == 0 && blockIdx.x == 0 && tile_id == 0 && col_idx == 0) {
+                    printf("[DEBUG] Block 0: tcgen05.ld returned (col=%d)\n", col);
+                }
 
                 // Fence after async load before using the data
                 asm volatile("tcgen05.fence::after_thread_sync;");
@@ -322,14 +363,19 @@ __global__ void my_matmul_kernel(
                     C[(global_row_base + 3) * N + global_col] = __float2bfloat16(r3);
                 }
             }
+
+            if (threadIdx.x == 0 && blockIdx.x == 0 && tile_id == 0) printf("[DEBUG] Block 0: Store phase complete\n");
         }
 
         // Sync before next output tile
         __syncthreads();
+
+        if (threadIdx.x == 0 && blockIdx.x == 0 && tile_id == 0) printf("[DEBUG] Block 0: Finished tile_id=0\n");
     }
 
     // deallocate tmem
     if (threadIdx.x == 0) {
+        if (blockIdx.x == 0) printf("[DEBUG] Block 0: Deallocating TMEM\n");
         uint32_t num_cols = TMEM_COLS;
         asm volatile(
             "tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, %1;"
@@ -337,6 +383,7 @@ __global__ void my_matmul_kernel(
             : "r"(tmem_base), "r"(num_cols)
             : "memory"
         );
+        if (blockIdx.x == 0) printf("[DEBUG] Block 0: TMEM deallocated, kernel done!\n");
     }
 }
 
