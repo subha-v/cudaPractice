@@ -4,6 +4,9 @@
 #include <random>
 #include <cuda.h>
 #include <cuda/barrier>
+#include <chrono>
+#include <cmath>
+#include <omp.h>
 
 // We want to launch 148 blocks and have those persistently running on the B200
 // A kernel is executed as a grid of blocks of threads
@@ -136,7 +139,7 @@ __global__ void my_matmul_kernel(
             for (int i = threadIdx.x; i < TILE_M * TILE_N; i += 128) {
                 uint32_t offset = i * sizeof(float);
                 asm volatile(
-                    "tcgen05.st.sync.aligned.32x1b.x1.b32 [%0], {%1};"
+                    "tcgen05.st.sync.aligned.32x1b.x1.b32 [%0], {%1};" 
                     :: "r"(tmem_base + offset), "r"(0)
                 );
             }
@@ -328,143 +331,194 @@ CUtensorMap create_tensor_map(
 }
 
 
-int main() {
+// =============================================================================
+// CPU reference GEMM for validation
+// =============================================================================
+void cpu_gemm(float* a, float* b, float* c, int M, int N, int K) {
+    #pragma omp parallel for collapse(2)  // Parallelize outer two loops across CPU cores
+    for (int i = 0; i < M; i++) {
+        for (int j = 0; j < N; j++) {
+            float sum = 0.0f;
+            for (int k = 0; k < K; k++) {
+                sum += a[i * K + k] * b[k * N + j];
+            }
+            c[i * N + j] = sum;
+        }
+    }
+}
+
+// =============================================================================
+// Benchmark function - runs kernel multiple times and measures TFLOPS
+// =============================================================================
+int run_benchmark(size_t M, size_t N, size_t K) {
     // Initialize CUDA driver API (required for TMA)
     cuInit(0);
 
-    // Matrix dimensions (must be divisible by tile sizes for now)
-    int M = 1024;  // Rows of A and C
-    int N = 1024;  // Cols of B and C
-    int K = 1024;  // Cols of A and Rows of B
+    cudaError_t cudaStatus;
 
-    std::cout << "Matrix dimensions: M=" << M << ", N=" << N << ", K=" << K << std::endl;
+    std::cout << "--------------------  M=" << M << " N=" << N << " K=" << K << "  --------------------\n";
     std::cout << "Tile sizes: TILE_M=" << TILE_M << ", TILE_N=" << TILE_N << ", TILE_K=" << TILE_K << std::endl;
 
-    //   Allocate memory on CPU (Host)
-
-
+    // Allocate host memory
     float* h_A = new float[M * K];
     float* h_B = new float[K * N];
-    float* h_C = new float[M * N];  // Output - will be filled by GPU
+    float* h_C = new float[M * N];
+    float* h_C_ref = new float[M * N];
 
     std::cout << "Allocated host memory" << std::endl;
 
-  
     // Initialize matrices with random values
-  
-
-    std::mt19937 gen(42);  
+    std::mt19937 gen(42);
     std::uniform_real_distribution<float> dis(-0.5f, 0.5f);
 
-    for (int i = 0; i < M * K; i++) h_A[i] = dis(gen);
-    for (int i = 0; i < K * N; i++) h_B[i] = dis(gen);
+    for (size_t i = 0; i < M * K; i++) h_A[i] = dis(gen);
+    for (size_t i = 0; i < K * N; i++) h_B[i] = dis(gen);
 
     std::cout << "Initialized matrices with random values" << std::endl;
 
+    // Perform CPU matrix multiplication for reference (only for small sizes)
+    bool do_validation = (M <= 2048);
+    if (do_validation) {
+        std::cout << "Computing CPU reference..." << std::endl;
+        cpu_gemm(h_A, h_B, h_C_ref, M, N, K);
+        std::cout << "Performed CPU matrix multiplication" << std::endl;
+    }
 
-    // Allocate memory on GPU (Device)
-
-    // "d_" prefix means "device" (GPU)
-    // cudaMalloc allocates memory in GPU's global memory (HBM)
-
+    // Allocate device memory
     __nv_bfloat16 *d_A, *d_B, *d_C;
-
     cudaMalloc(&d_A, M * K * sizeof(__nv_bfloat16));
     cudaMalloc(&d_B, K * N * sizeof(__nv_bfloat16));
     cudaMalloc(&d_C, M * N * sizeof(__nv_bfloat16));
 
-    // Check for errors
-    cudaError_t err = cudaGetLastError();
-    if (err != cudaSuccess) {
-        std::cerr << "cudaMalloc failed: " << cudaGetErrorString(err) << std::endl;
+    cudaStatus = cudaGetLastError();
+    if (cudaStatus != cudaSuccess) {
+        std::cerr << "CUDA error: " << cudaGetErrorString(cudaStatus) << std::endl;
         return -1;
     }
 
     std::cout << "Allocated device memory" << std::endl;
 
-    // =========================================================================
-    // Step 4: Convert to bfloat16 and copy CPU → GPU
-    // =========================================================================
-    // We need to convert float32 to bfloat16 before copying
-
+    // Convert to bfloat16 and copy to device
     __nv_bfloat16* h_A_bf16 = new __nv_bfloat16[M * K];
     __nv_bfloat16* h_B_bf16 = new __nv_bfloat16[K * N];
 
-    for (int i = 0; i < M * K; i++) h_A_bf16[i] = __float2bfloat16(h_A[i]);
-    for (int i = 0; i < K * N; i++) h_B_bf16[i] = __float2bfloat16(h_B[i]);
+    for (size_t i = 0; i < M * K; i++) h_A_bf16[i] = __float2bfloat16(h_A[i]);
+    for (size_t i = 0; i < K * N; i++) h_B_bf16[i] = __float2bfloat16(h_B[i]);
 
-    // cudaMemcpy copies data between host and device
-    // cudaMemcpyHostToDevice = CPU → GPU
     cudaMemcpy(d_A, h_A_bf16, M * K * sizeof(__nv_bfloat16), cudaMemcpyHostToDevice);
     cudaMemcpy(d_B, h_B_bf16, K * N * sizeof(__nv_bfloat16), cudaMemcpyHostToDevice);
 
     std::cout << "Copied matrices to device" << std::endl;
 
-    // =========================================================================
-    // Step 5: Create TMA descriptors
-    // =========================================================================
-    // TMA descriptors tell the hardware how to interpret the memory layout
-
-    // For matrix A [M x K]: tiles are [TILE_M x TILE_K] = [128 x 64]
+    // Create TMA descriptors
     CUtensorMap tensor_map_A = create_tensor_map(d_A, M, K, TILE_M, TILE_K);
-    std::cout << "Created TMA descriptor for A" << std::endl;
-
-    // For matrix B [K x N]: tiles are [TILE_K x TILE_N] = [64 x 256]
     CUtensorMap tensor_map_B = create_tensor_map(d_B, K, N, TILE_K, TILE_N);
-    std::cout << "Created TMA descriptor for B" << std::endl;
 
-    // launch kernel
+    std::cout << "Created TMA descriptors" << std::endl;
+
+    // Launch configuration
     dim3 grid(148, 1);       // 148 blocks (one per SM on B200)
     dim3 block(NUM_THREADS); // 256 threads per block (2 warpgroups)
 
     std::cout << "Launching kernel with grid(" << grid.x << "), block(" << block.x << ")" << std::endl;
-    std::cout << "  - " << grid.x << " blocks" << std::endl;
-    std::cout << "  - " << block.x << " threads per block" << std::endl;
-    std::cout << "  - " << block.x / 32 << " warps per block" << std::endl;
-    std::cout << "  - " << block.x / 128 << " warpgroups per block" << std::endl;
 
-    // Now passing TMA descriptors instead of raw pointers for A and B
+    // Warmup run
+    std::cout << "Warmup..." << std::endl;
     my_matmul_kernel<<<grid, block>>>(tensor_map_A, tensor_map_B, d_C, M, N, K);
-
-    // Wait for kernel to finish
     cudaDeviceSynchronize();
 
-    // Check for errors
-    err = cudaGetLastError();
-    if (err != cudaSuccess) {
-        std::cerr << "Kernel failed: " << cudaGetErrorString(err) << std::endl;
+    cudaStatus = cudaGetLastError();
+    if (cudaStatus != cudaSuccess) {
+        std::cerr << "Kernel failed: " << cudaGetErrorString(cudaStatus) << std::endl;
         return -1;
     }
 
-    std::cout << "Kernel finished!" << std::endl;
+    // Benchmark runs
+    constexpr int ITERS = 5;
+    cudaDeviceSynchronize();
+    auto start = std::chrono::high_resolution_clock::now();
 
-    // Copy result
+    for (int i = 0; i < ITERS; i++) {
+        my_matmul_kernel<<<grid, block>>>(tensor_map_A, tensor_map_B, d_C, M, N, K);
+    }
+    cudaDeviceSynchronize();
+
+    auto end = std::chrono::high_resolution_clock::now();
+
+    // Calculate duration
+    std::chrono::duration<double> diff = end - start;
+    double useconds = diff.count() * 1e6 / ITERS;
+
+    // Calculate TFLOPs
+    double flops = double(2.0) * M * N * K; // 2 FLOPs per multiply-add
+    double tflops = (flops / useconds) / 1e6;
+
+    std::cout << "Avg Kernel execution time: " << useconds << " us\n";
+    std::cout << "Achieved performance: " << tflops << " TFLOPs\n";
+
+    // Check for CUDA errors
+    cudaStatus = cudaGetLastError();
+    if (cudaStatus != cudaSuccess) {
+        std::cerr << "CUDA error: " << cudaGetErrorString(cudaStatus) << std::endl;
+        return -1;
+    }
+
+    // Copy result back to host
     __nv_bfloat16* h_C_bf16 = new __nv_bfloat16[M * N];
-
-    // cudaMemcpyDeviceToHost = GPU → CPU
     cudaMemcpy(h_C_bf16, d_C, M * N * sizeof(__nv_bfloat16), cudaMemcpyDeviceToHost);
 
-    // Convert back to float for verification
-    for (int i = 0; i < M * N; i++) h_C[i] = __bfloat162float(h_C_bf16[i]);
+    // Convert result back to float for comparison
+    for (size_t i = 0; i < M * N; i++) h_C[i] = __bfloat162float(h_C_bf16[i]);
 
-    std::cout << "Copied result back to host" << std::endl;
+    // Validate results (only for small sizes)
+    if (do_validation) {
+        float max_error = 0.0f;
+        float average_error = 0.0f;
+        int error_count = 0;
+        for (size_t i = 0; i < M * N; i++) {
+            float error = std::abs(h_C[i] - h_C_ref[i]);
+            if (error > 1.0f) { // large threshold because of bf16 vs fp32 numerics
+                if (error_count < 20) {
+                    std::cout << "Error at row " << i / N << " col " << i % N
+                              << ": " << h_C[i] << " != " << h_C_ref[i] << " (ref)" << std::endl;
+                } else if (error_count == 20) {
+                    std::cout << "Too many errors to show them all.\n";
+                }
+                error_count++;
+            }
+            max_error = std::max(max_error, error);
+            average_error += error;
+        }
+        average_error /= M * N;
 
+        std::cout << "Max error: " << max_error << std::endl;
+        std::cout << "Average error: " << average_error << std::endl;
+        std::cout << "Error count: " << error_count << std::endl;
+    }
 
-    // Free GPU memory
+    // Clean up
+    delete[] h_A;
+    delete[] h_B;
+    delete[] h_C;
+    delete[] h_C_ref;
+    delete[] h_A_bf16;
+    delete[] h_B_bf16;
+    delete[] h_C_bf16;
     cudaFree(d_A);
     cudaFree(d_B);
     cudaFree(d_C);
 
-    // Free CPU memory
-    delete[] h_A;
-    delete[] h_B;
-    delete[] h_C;
-    delete[] h_A_bf16;
-    delete[] h_B_bf16;
-    delete[] h_C_bf16;
+    std::cout << "Done!\n" << std::endl;
 
-    std::cout << "Cleaned up memory" << std::endl;
-    std::cout << "Done!" << std::endl;
+    return 0;
+}
+
+int main() {
+    // Run benchmarks at different sizes
+    run_benchmark(1024, 1024, 1024);
+    run_benchmark(2048, 2048, 2048);
+    run_benchmark(4096, 4096, 4096);
+    run_benchmark(8192, 8192, 8192);
 
     return 0;
 }
