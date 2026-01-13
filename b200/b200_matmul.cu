@@ -96,28 +96,44 @@ __global__ void my_matmul_kernel(
     __shared__ __nv_bfloat16 a_smem[PIPE_DEPTH][TILE_M * TILE_K];  // 4 x 128 x 64
     __shared__ __nv_bfloat16 b_smem[PIPE_DEPTH][TILE_K * TILE_N];  // 4 x 64 x 256
 
+    // Output staging buffer in SMEM for TMEM -> global transfer
+    __shared__ float c_smem[TILE_M * TILE_N];  // 128 x 256 floats
+
     // TMEM base address for accumulator (allocated per-block)
     __shared__ uint32_t tmem_base;
 
-    // Barriers for producer/consumer synchronization
-    __shared__ cuda::barrier<cuda::thread_scope_block> inputs_arrived[PIPE_DEPTH];   // Producer -> Consumer: data ready
-    __shared__ cuda::barrier<cuda::thread_scope_block> inputs_finished[PIPE_DEPTH];  // Consumer -> Producer: slot free
+    // Barriers for producer/consumer synchronization - use alignas for proper alignment
+    __shared__ alignas(8) uint64_t inputs_arrived_storage[PIPE_DEPTH];
+    __shared__ alignas(8) uint64_t inputs_finished_storage[PIPE_DEPTH];
+
+    // Cast to barrier pointers
+    cuda::barrier<cuda::thread_scope_block>* inputs_arrived =
+        reinterpret_cast<cuda::barrier<cuda::thread_scope_block>*>(inputs_arrived_storage);
+    cuda::barrier<cuda::thread_scope_block>* inputs_finished =
+        reinterpret_cast<cuda::barrier<cuda::thread_scope_block>*>(inputs_finished_storage);
 
     // initialization
     if (threadIdx.x == 0) {
-        // Initialize barriers
-        // inputs_arrived: expects 1 arrival from barrier_arrive_tx + 1 from consumer's arrive_and_wait
-        // inputs_finished: expects 1 arrival from consumer when done with slot
+        // Initialize barriers using PTX mbarrier.init
         for (int i = 0; i < PIPE_DEPTH; i++) {
-            init(&inputs_arrived[i], 2);
-            init(&inputs_finished[i], 2);  // Producer waits, consumer signals
+            uint64_t* arrived_ptr = &inputs_arrived_storage[i];
+            uint64_t* finished_ptr = &inputs_finished_storage[i];
+            asm volatile(
+                "mbarrier.init.shared.b64 [%0], %1;"
+                :: "l"(__cvta_generic_to_shared(arrived_ptr)), "r"(2)
+            );
+            asm volatile(
+                "mbarrier.init.shared.b64 [%0], %1;"
+                :: "l"(__cvta_generic_to_shared(finished_ptr)), "r"(2)
+            );
         }
 
         // allocates TMEM for 128x256 float accumulator (256 columns of 512 bytes each)
+        uint32_t num_cols = TMEM_COLS;
         asm volatile(
             "tcgen05.alloc.cta_group::1.sync.aligned.b32 %0, %1;"
             : "=r"(tmem_base)
-            : "r"(TMEM_COLS)
+            : "r"(num_cols)
         );
     }
     __syncthreads();
@@ -136,21 +152,7 @@ __global__ void my_matmul_kernel(
         int tile_col = tile_id % num_tiles_n;
 
         // Note the following 2 if statements run in parallel :D
-
-        // Consumer warpgroup zeros the TMEM at start of each output tile
-        if (wg_id == 0) {
-            // Each thread in consumer warpgroup zeros a portion of TMEM
-            // 128x256 floats = 32768 floats, 128 threads, so 256 floats per thread
-            // TMEM is column-major, 512 bytes per column = 128 floats per column
-            for (int i = threadIdx.x; i < TILE_M * TILE_N; i += 128) {
-                uint32_t offset = i * sizeof(float);
-                asm volatile(
-                    "tcgen05.st.sync.aligned.32x1b.x1.b32 [%0], {%1};" 
-                    :: "r"(tmem_base + offset), "r"(0)
-                );
-            }
-        }
-        // No __syncthreads__ here! Consumer and Producer work in parallel
+        // TMEM zeroing is handled by using scale_d=0 on first WGMMA iteration
 
         // 1 thread of the producer loads the first tiles
         if (wg_id == 1 && threadIdx.x == 128) {  // First thread of producer warpgroup
@@ -195,7 +197,7 @@ __global__ void my_matmul_kernel(
                 // Using Blackwell m128n256k16 WGMMA: 4 k-steps (TILE_K=64, step=16)
                 // Each wgmma handles 128 rows, 256 cols, 16 k-elements in ONE call
 
-                #pragma unroll // idk chatgpt said to do this ... but apparently it unrolls this for loop and speeds up the math :D
+                #pragma unroll
                 for (int k_step = 0; k_step < TILE_K; k_step += 16) { // K = 64
                     // A offset: k_step columns into the 128x64 A tile
                     // B offset: k_step rows into the 64x256 B tile
@@ -203,17 +205,30 @@ __global__ void my_matmul_kernel(
                     uint32_t b_offset = k_step * TILE_N * sizeof(__nv_bfloat16);
 
                     // Single WGMMA computes: C[128x256] += A[128x16] × B[16x256]
-                    asm volatile(
-                        "wgmma.mma_async.sync.aligned.m128n256k16.f32.bf16.bf16 "
-                        // this command means wgmma mma (matrix multiply accumulate) with 128 x 256 x 16 dimensions
-                        // output is f32 and inputs are bf16
-                        "[%0], [%1], [%2], 1, 1, 1, 0, 1;"
-                        :
-                        : "r"(tmem_base),           // Output: full 128x256 tile in TMEM
-                          "r"(a_addr + a_offset),   // Input A: 128 rows × 16 cols
-                          "r"(b_addr + b_offset)    // Input B: 16 rows × 256 cols
-                        : "memory"
-                    );
+                    // scale_d=0 on first iteration to zero accumulator, scale_d=1 otherwise
+                    if (k_tile == 0 && k_step == 0) {
+                        // First iteration: scale_d=0 zeros the accumulator
+                        asm volatile(
+                            "wgmma.mma_async.sync.aligned.m128n256k16.f32.bf16.bf16 "
+                            "[%0], [%1], [%2], 0, 1, 1, 0, 1;"
+                            :
+                            : "r"(tmem_base),
+                              "r"(a_addr + a_offset),
+                              "r"(b_addr + b_offset)
+                            : "memory"
+                        );
+                    } else {
+                        // Subsequent iterations: scale_d=1 accumulates
+                        asm volatile(
+                            "wgmma.mma_async.sync.aligned.m128n256k16.f32.bf16.bf16 "
+                            "[%0], [%1], [%2], 1, 1, 1, 0, 1;"
+                            :
+                            : "r"(tmem_base),
+                              "r"(a_addr + a_offset),
+                              "r"(b_addr + b_offset)
+                            : "memory"
+                        );
+                    }
                 }
 
                 // Wait for all WGMMA operations to complete
@@ -250,28 +265,50 @@ __global__ void my_matmul_kernel(
             asm volatile("wgmma.commit_group.sync.aligned;");
             asm volatile("wgmma.wait_group.sync.aligned 0;");
 
-            // Each thread reads and stores multiple elements
-            // 128x256 = 32768 elements, 128 threads = 256 elements per thread
-            for (int i = threadIdx.x; i < TILE_M * TILE_N; i += 128) {
-                int local_row = i / TILE_N;
-                int local_col = i % TILE_N;
-                int global_row = tile_row * TILE_M + local_row;
-                int global_col = tile_col * TILE_N + local_col;
+            // Load from TMEM to registers and store to SMEM
+            // Each thread in warpgroup (128 threads) loads multiple values
+            // TMEM has 256 columns of 512 bytes (128 floats each) = 32768 floats total
+            // Each of 128 consumer threads handles 256 floats
 
-                // Read from TMEM
+            int tid = threadIdx.x;  // 0-127 for consumer warpgroup
+            for (int col = 0; col < TMEM_COLS; col++) {
+                // Each column is 512 bytes = 128 floats
+                // Thread tid gets float at row=tid within each column
+                uint32_t tmem_offset = col * 512 + tid * sizeof(float);
+
                 float val;
-                uint32_t tmem_offset = (local_row * TILE_N + local_col) * sizeof(float);
                 asm volatile(
-                    "tcgen05.ld.sync.aligned.32x1b.x1.b32 {%0}, [%1];"
-                    : "=r"(*(uint32_t*)&val)
+                    "tcgen05.ld.sync.aligned.16x32b.x1.b32 {%0}, [%1];"
+                    : "=f"(val)
                     : "r"(tmem_base + tmem_offset)
                 );
 
-                // Store to global memory
-                C[global_row * N + global_col] = __float2bfloat16(val);
+                // Store to SMEM at corresponding position
+                // TMEM layout: column-major with 128 rows per column
+                // SMEM layout: row-major TILE_M x TILE_N
+                int smem_row = tid;  // 0-127
+                int smem_col = col;  // 0-255
+                c_smem[smem_row * TILE_N + smem_col] = val;
             }
         }
-        // Sync before next output tile to ensure all stores complete
+
+        // All threads sync before reading from c_smem
+        __syncthreads();
+
+        // Now all threads can copy from SMEM to global memory
+        // Each of 256 threads handles 128 elements (32768 / 256 = 128)
+        for (int i = threadIdx.x; i < TILE_M * TILE_N; i += NUM_THREADS) {
+            int local_row = i / TILE_N;
+            int local_col = i % TILE_N;
+            int global_row = tile_row * TILE_M + local_row;
+            int global_col = tile_col * TILE_N + local_col;
+
+            // Read from SMEM and store to global memory
+            float val = c_smem[i];
+            C[global_row * N + global_col] = __float2bfloat16(val);
+        }
+
+        // Sync before next output tile
         __syncthreads();
     }
 
