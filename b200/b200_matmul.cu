@@ -29,15 +29,15 @@ constexpr int TMEM_COLS = 256;
 
 // helper function to make tma load from gmem to smem
 __device__ __forceinline__ void launch_tma_load(
-    int slot,                                              // Which pipeline slot to load into
-    int k_tile,                                            // Which k-tile to load
-    int tile_row,                                          // Row coordinate for A
-    int tile_col,                                          // Column coordinate for B
-    __nv_bfloat16 a_smem[][TILE_M * TILE_K],              // Shared memory for A tiles
-    __nv_bfloat16 b_smem[][TILE_K * TILE_N],              // Shared memory for B tiles
-    cuda::barrier<cuda::thread_scope_block>* barrier,      // Barrier to signal on completion
-    const CUtensorMap* tensor_map_A,                       // TMA descriptor for A
-    const CUtensorMap* tensor_map_B                        // TMA descriptor for B
+    int slot,                                             
+    int k_tile,                                         
+    int tile_row,                                        
+    int tile_col,                                         
+    __nv_bfloat16 a_smem[][TILE_M * TILE_K],            
+    __nv_bfloat16 b_smem[][TILE_K * TILE_N],            
+    cuda::barrier<cuda::thread_scope_block>* barrier,      // which barrier to signal
+    const CUtensorMap* tensor_map_A,                     
+    const CUtensorMap* tensor_map_B                  
 ) {
     // Calculate expected bytes for barrier
     uint32_t bytes_A = TILE_M * TILE_K * sizeof(__nv_bfloat16);
@@ -45,7 +45,7 @@ __device__ __forceinline__ void launch_tma_load(
     uint32_t expected_bytes = bytes_A + bytes_B;
 
     // Signal barrier with expected transaction bytes using PTX
-    // This is equivalent to cuda::barrier_arrive_tx(*barrier, 1, expected_bytes)
+
     uint64_t barrier_ptr = __cvta_generic_to_shared(barrier);
     asm volatile(
         "mbarrier.arrive.expect_tx.shared.b64 _, [%0], %1;"
@@ -54,7 +54,7 @@ __device__ __forceinline__ void launch_tma_load(
         : "memory"
     );
 
-    // Launch TMA for matrix A: loads tile [TILE_M x TILE_K] at position (tile_row, k_tile)
+    //launch tma for a
     asm volatile(
         "cp.async.bulk.tensor.2d.shared::cluster.global.mbarrier::complete_tx::bytes"
         " [%0], [%1, {%2, %3}], [%4];"
@@ -67,8 +67,7 @@ __device__ __forceinline__ void launch_tma_load(
         : "memory"
     );
 
-    // Launch TMA for matrix B: loads tile [TILE_K x TILE_N]
-    // B is now column-major (N x K), so coordinate 0 = k_tile (inner), coordinate 1 = tile_col (outer)
+    // launch tma for b
     asm volatile(
         "cp.async.bulk.tensor.2d.shared::cluster.global.mbarrier::complete_tx::bytes"
         " [%0], [%1, {%2, %3}], [%4];"
@@ -83,10 +82,10 @@ __device__ __forceinline__ void launch_tma_load(
 }
 
 __global__ void my_matmul_kernel(
-    const __grid_constant__ CUtensorMap tensor_map_A,  // TMA descriptor for A
-    const __grid_constant__ CUtensorMap tensor_map_B,  // TMA descriptor for B
-    __nv_bfloat16* __restrict__ C,                     // [M x N] matrix in global memory (output)
-    int M, int N, int K                                // Matrix dimensions
+    const __grid_constant__ CUtensorMap tensor_map_A,  
+    const __grid_constant__ CUtensorMap tensor_map_B,  
+    __nv_bfloat16* __restrict__ C,                  
+    int M, int N, int K                            
 ) {
     // what thread am i? producer or consumer and which warp am i in 
     int warp_id = threadIdx.x / 32;        // Which warp (0-7 for 256 threads)
@@ -96,16 +95,14 @@ __global__ void my_matmul_kernel(
     // Ring buffer for A and B tiles
     __shared__ __nv_bfloat16 a_smem[PIPE_DEPTH][TILE_M * TILE_K];  // 4 x 128 x 64
     __shared__ __nv_bfloat16 b_smem[PIPE_DEPTH][TILE_K * TILE_N];  // 4 x 64 x 256
-    // Note: No c_smem staging buffer - write directly to global to save SMEM
 
-    // TMEM base address for accumulator (allocated per-block)
     __shared__ uint32_t tmem_base;
 
-    // Barriers for producer/consumer synchronization - use alignas for proper alignment
+    // barriers
     __shared__ alignas(8) uint64_t inputs_arrived_storage[PIPE_DEPTH];
     __shared__ alignas(8) uint64_t inputs_finished_storage[PIPE_DEPTH];
 
-    // Cast to barrier pointers
+    // cast to barrier pointers
     cuda::barrier<cuda::thread_scope_block>* inputs_arrived =
         reinterpret_cast<cuda::barrier<cuda::thread_scope_block>*>(inputs_arrived_storage);
     cuda::barrier<cuda::thread_scope_block>* inputs_finished =
@@ -133,13 +130,14 @@ __global__ void my_matmul_kernel(
 
     // TMEM allocation - tcgen05.alloc with cta_group::1 is a COLLECTIVE operation
     // for exactly 1 warpgroup (128 threads). Only threads 0-127 should execute it.
+    // somehow this is printing but then it hangs after this :((()))
     if (threadIdx.x == 0 && blockIdx.x == 0) printf("[DEBUG] Block 0: Warpgroup 0 allocating TMEM\n");
-    __syncthreads();  // IMPORTANT: Reconverge after printf
+    __syncthreads();  // IMPORTANT: Reconverge after printf ???
 
     uint32_t num_cols = TMEM_COLS;
     uint32_t tmem_base_smem_addr = __cvta_generic_to_shared(&tmem_base);
 
-    // Only first warpgroup (threads 0-127) executes tcgen05.alloc
+    // Only first warpgroup (threads 0-127) executes tcgen05.alloc - i dont know if this is correct....
     if (threadIdx.x < 128) {
         asm volatile(
             "tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;"
@@ -150,6 +148,7 @@ __global__ void my_matmul_kernel(
     }
     __syncthreads();  // Ensure all threads see the allocated tmem_base
 
+    // This is currently not printing
     if (threadIdx.x == 0 && blockIdx.x == 0) printf("[DEBUG] Block 0: TMEM allocated, tmem_base=%u\n", tmem_base);
 
     int num_tiles_m = M / TILE_M;
@@ -232,7 +231,7 @@ __global__ void my_matmul_kernel(
 
                 if (threadIdx.x == 0 && blockIdx.x == 0 && k_tile == 0) printf("[DEBUG] Block 0: Starting tcgen05.mma loop\n");
 
-                #pragma unroll
+                 // paragma unroll could be used.. 
                 for (int k_step = 0; k_step < TILE_K; k_step += 16) { // K = 64
                     // A offset: k_step columns into the 128x64 A tile
                     // B offset: k_step rows into the 64x256 B tile
@@ -244,11 +243,11 @@ __global__ void my_matmul_kernel(
                     uint32_t a_smem_addr = a_addr + a_offset;
                     uint32_t b_smem_addr = b_addr + b_offset;
 
-                    // A: 128xK row-major, leading dim = K*2 bytes
+                    // a desc
                     uint64_t a_desc = ((uint64_t)((a_smem_addr >> 4) & 0x3FFF)) |
                                       ((uint64_t)(((TILE_K * 2) >> 4) & 0x3FFF) << 16);
 
-                    // B: Kx256 column-major, leading dim = K*2 bytes
+                    // b desc
                     uint64_t b_desc = ((uint64_t)((b_smem_addr >> 4) & 0x3FFF)) |
                                       ((uint64_t)(((TILE_K * 2) >> 4) & 0x3FFF) << 16);
 
@@ -257,8 +256,7 @@ __global__ void my_matmul_kernel(
                                tmem_base, (unsigned long long)a_desc, (unsigned long long)b_desc, idesc);
                     }
 
-                    // enable_input_d: 0 = D = A*B (no accum), 1 = D = A*B + D (accum)
-                    // First iteration zeros accumulator, rest accumulate
+                    // first iteration zeros accumulator lol the rest are mm
                     if (k_tile == 0 && k_step == 0) {
                         if (threadIdx.x == 0 && blockIdx.x == 0) printf("[DEBUG] Block 0: Calling tcgen05.mma (first, no accum)\n");
                         // D = A*B (enable_d = 0, no accumulation)
@@ -283,7 +281,6 @@ __global__ void my_matmul_kernel(
                 if (threadIdx.x == 0 && blockIdx.x == 0 && k_tile == 0) printf("[DEBUG] Block 0: Finished tcgen05.mma loop for k_tile=0\n");
 
                 // Wait for all MMA operations to complete
-                // TODO: For proper async completion, use tcgen05.commit + mbarrier pattern
                 // For now, using fence as synchronization point
                 asm volatile("tcgen05.fence::before_thread_sync;");
 
@@ -319,9 +316,9 @@ __global__ void my_matmul_kernel(
             asm volatile("tcgen05.fence::before_thread_sync;");
 
             // tcgen05.ld is warp-collective: all 32 threads in a warp must use same taddr
-            // Using shape .16x256b.x1: loads 512 bytes (1 TMEM column = 128 floats)
-            // Each thread gets 4 registers (4 floats), 32 threads × 4 = 128 floats
-            // Consumer warpgroup has 4 warps, each handles 64 columns (256/4)
+            // using shape .16x256b.x1: loads 512 bytes (1 TMEM column = 128 floats)
+            // each thread gets 4 registers (4 floats), 32 threads × 4 = 128 floats
+            // consumer warpgroup has 4 warps, each handles 64 columns (256/4)
 
             int warp_in_consumer = threadIdx.x / 32;  // 0-3 within consumer warpgroup
             int lane_id = threadIdx.x % 32;           // 0-31 within warp
@@ -332,7 +329,7 @@ __global__ void my_matmul_kernel(
             for (int col_idx = 0; col_idx < cols_per_warp; col_idx++) {
                 int col = warp_in_consumer * cols_per_warp + col_idx;
 
-                // All threads in warp use the SAME taddr (base of this column)
+                // all threads in warp use the SAME taddr (base of this column)
                 uint32_t taddr = tmem_base + col * 512;  // 512 bytes per column
 
                 if (threadIdx.x == 0 && blockIdx.x == 0 && tile_id == 0 && col_idx == 0) {
@@ -383,7 +380,7 @@ __global__ void my_matmul_kernel(
     __syncthreads();  // Reconverge after printf
 
     uint32_t dealloc_num_cols = TMEM_COLS;
-    // Only first warpgroup (threads 0-127) executes tcgen05.dealloc
+    // idk if this is correct. only the first 128 threads do this? 
     if (threadIdx.x < 128) {
         asm volatile(
             "tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, %1;"
@@ -408,41 +405,35 @@ CUtensorMap create_tensor_map(
     CUtensorMap tensor_map;
 
     // Dimensions of the full matrix (in elements)
-    // Note: TMA uses column-major-ish ordering: {inner_dim, outer_dim}
     cuuint64_t globalDim[2] = {(cuuint64_t)cols, (cuuint64_t)rows};
 
-    // Strides in bytes - for rank=2, only need 1 stride (row stride)
-    // The innermost stride (column) is implicit from element size
+    // strides
     cuuint64_t globalStrides[1] = {
         (cuuint64_t)cols * sizeof(__nv_bfloat16)  // Stride to next row in bytes
     };
-
-    // Tile dimensions
     cuuint32_t boxDim[2] = {(cuuint32_t)tile_cols, (cuuint32_t)tile_rows};
-
-    // Element strides (typically 1)
     cuuint32_t elementStrides[2] = {1, 1};
 
-    // Debug: print TMA parameters
+    //debug
     std::cout << "TMA params: globalDim={" << globalDim[0] << "," << globalDim[1] << "}"
               << " boxDim={" << boxDim[0] << "," << boxDim[1] << "}"
               << " stride=" << globalStrides[0]
               << " boxDim[0]*sizeof=" << (boxDim[0] * sizeof(__nv_bfloat16)) << " bytes" << std::endl;
 
-    // Create the TMA descriptor
+
     CUresult result = cuTensorMapEncodeTiled(
         &tensor_map,
-        CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,       // Data type
-        2,                                       // Rank (2D tensor)
-        global_ptr,                              // Global memory pointer
-        globalDim,                               // Dimensions of full tensor
-        globalStrides,                           // Strides in bytes
-        boxDim,                                  // Tile dimensions
-        elementStrides,                          // Element strides
-        CU_TENSOR_MAP_INTERLEAVE_NONE,          // No interleaving
-        CU_TENSOR_MAP_SWIZZLE_NONE,             // No swizzling
-        CU_TENSOR_MAP_L2_PROMOTION_NONE,        // L2 promotion setting
-        CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE       // Out-of-bounds fill
+        CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,      
+        2,                                      
+        global_ptr,                          
+        globalDim,                             
+        globalStrides,                         
+        boxDim,                                 
+        elementStrides,                        
+        CU_TENSOR_MAP_INTERLEAVE_NONE,         
+        CU_TENSOR_MAP_SWIZZLE_NONE,           
+        CU_TENSOR_MAP_L2_PROMOTION_NONE,       
+        CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE     
     );
 
     if (result != CUDA_SUCCESS) {
@@ -456,11 +447,9 @@ CUtensorMap create_tensor_map(
 }
 
 
-// =============================================================================
-// CPU reference GEMM for validation
-// =============================================================================
+// cpu
 void cpu_gemm(float* a, float* b, float* c, int M, int N, int K) {
-    #pragma omp parallel for collapse(2)  // Parallelize outer two loops across CPU cores
+    #pragma omp parallel for collapse(2)  
     for (int i = 0; i < M; i++) {
         for (int j = 0; j < N; j++) {
             float sum = 0.0f;
@@ -472,9 +461,7 @@ void cpu_gemm(float* a, float* b, float* c, int M, int N, int K) {
     }
 }
 
-// =============================================================================
-// Benchmark function - runs kernel multiple times and measures TFLOPS
-// =============================================================================
+// benchmark
 int run_benchmark(size_t M, size_t N, size_t K) {
     // Initialize CUDA driver API (required for TMA)
     cuInit(0);
@@ -501,7 +488,7 @@ int run_benchmark(size_t M, size_t N, size_t K) {
 
     std::cout << "Initialized matrices with random values" << std::endl;
 
-    // Perform CPU matrix multiplication for reference (only for small sizes)
+    // cpu
     bool do_validation = (M <= 2048);
     if (do_validation) {
         std::cout << "Computing CPU reference..." << std::endl;
@@ -531,8 +518,7 @@ int run_benchmark(size_t M, size_t N, size_t K) {
     for (size_t i = 0; i < M * K; i++) h_A_bf16[i] = __float2bfloat16(h_A[i]);
 
     // B needs to be column-major for TMA (K contiguous, not N)
-    // Original B is K x N row-major: B[k,n] at index k*N + n
-    // Column-major B: B[k,n] at index n*K + k
+  
     for (size_t k = 0; k < K; k++) {
         for (size_t n = 0; n < N; n++) {
             h_B_bf16[n * K + k] = __float2bfloat16(h_B[k * N + n]);
@@ -545,9 +531,9 @@ int run_benchmark(size_t M, size_t N, size_t K) {
     std::cout << "Copied matrices to device (B in column-major)" << std::endl;
 
     // Create TMA descriptors
-    // A: M x K row-major, inner dim = K, boxDim[0] = TILE_K = 64 ✓
+    // A: M x K row-major, inner dim = K, boxDim[0] = TILE_K = 64 
     CUtensorMap tensor_map_A = create_tensor_map(d_A, M, K, TILE_M, TILE_K);
-    // B: now N x K column-major (K contiguous), inner dim = K, boxDim[0] = TILE_K = 64 ✓
+    // B: now N x K column-major (K contiguous), inner dim = K, boxDim[0] = TILE_K = 64 
     CUtensorMap tensor_map_B = create_tensor_map(d_B, N, K, TILE_N, TILE_K);
 
     std::cout << "Created TMA descriptors" << std::endl;
