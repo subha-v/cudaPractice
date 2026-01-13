@@ -54,9 +54,9 @@ __device__ __forceinline__ void launch_tma_load(
         : "memory"
     );
 
-    //launch tma for a
+    //launch tma for a - use shared::cta instead of shared::cluster (no cluster configured)
     asm volatile(
-        "cp.async.bulk.tensor.2d.shared::cluster.global.mbarrier::complete_tx::bytes"
+        "cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes"
         " [%0], [%1, {%2, %3}], [%4];"
         :
         : "r"((uint32_t)__cvta_generic_to_shared(a_smem[slot])),
@@ -67,9 +67,9 @@ __device__ __forceinline__ void launch_tma_load(
         : "memory"
     );
 
-    // launch tma for b
+    // launch tma for b - use shared::cta instead of shared::cluster
     asm volatile(
-        "cp.async.bulk.tensor.2d.shared::cluster.global.mbarrier::complete_tx::bytes"
+        "cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes"
         " [%0], [%1, {%2, %3}], [%4];"
         :
         : "r"((uint32_t)__cvta_generic_to_shared(b_smem[slot])),
@@ -135,6 +135,8 @@ __global__ void my_matmul_kernel(
     __syncthreads();  // IMPORTANT: Reconverge after printf ???
 
     uint32_t num_cols = TMEM_COLS;
+
+    // generic to shared converts a pointer from generic to a pointer in shared memory? 
     uint32_t tmem_base_smem_addr = __cvta_generic_to_shared(&tmem_base);
 
     // Only first warpgroup (threads 0-127) executes tcgen05.alloc - i dont know if this is correct....
@@ -543,6 +545,11 @@ int run_benchmark(size_t M, size_t N, size_t K) {
     dim3 block(NUM_THREADS); // 256 threads per block (2 warpgroups)
 
     std::cout << "Launching kernel with grid(" << grid.x << "), block(" << block.x << ")" << std::endl;
+
+    // Maximize dynamic shared memory for the kernel (TMA/TMEM kernels need more)
+    cudaFuncSetAttribute(my_matmul_kernel,
+                         cudaFuncAttributeMaxDynamicSharedMemorySize,
+                         98304); // Set to max (~100KB on B200)
 
     // Warmup run
     std::cout << "Warmup..." << std::endl;
