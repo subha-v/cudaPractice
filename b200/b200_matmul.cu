@@ -131,19 +131,23 @@ __global__ void my_matmul_kernel(
     }
     __syncthreads();  // Ensure barriers are initialized before TMEM alloc
 
-    // TMEM allocation - tcgen05.alloc is a COLLECTIVE operation
-    // All threads must execute it together (.sync.aligned)
-    if (threadIdx.x == 0 && blockIdx.x == 0) printf("[DEBUG] Block 0: All threads allocating TMEM\n");
-    __syncthreads();  // IMPORTANT: Reconverge after printf before collective op
+    // TMEM allocation - tcgen05.alloc with cta_group::1 is a COLLECTIVE operation
+    // for exactly 1 warpgroup (128 threads). Only threads 0-127 should execute it.
+    if (threadIdx.x == 0 && blockIdx.x == 0) printf("[DEBUG] Block 0: Warpgroup 0 allocating TMEM\n");
+    __syncthreads();  // IMPORTANT: Reconverge after printf
 
     uint32_t num_cols = TMEM_COLS;
     uint32_t tmem_base_smem_addr = __cvta_generic_to_shared(&tmem_base);
-    asm volatile(
-        "tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;"
-        :
-        : "r"(tmem_base_smem_addr), "r"(num_cols)
-        : "memory"
-    );
+
+    // Only first warpgroup (threads 0-127) executes tcgen05.alloc
+    if (threadIdx.x < 128) {
+        asm volatile(
+            "tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;"
+            :
+            : "r"(tmem_base_smem_addr), "r"(num_cols)
+            : "memory"
+        );
+    }
     __syncthreads();  // Ensure all threads see the allocated tmem_base
 
     if (threadIdx.x == 0 && blockIdx.x == 0) printf("[DEBUG] Block 0: TMEM allocated, tmem_base=%u\n", tmem_base);
@@ -373,18 +377,21 @@ __global__ void my_matmul_kernel(
         if (threadIdx.x == 0 && blockIdx.x == 0 && tile_id == 0) printf("[DEBUG] Block 0: Finished tile_id=0\n");
     }
 
-    // deallocate tmem - tcgen05.dealloc is also a COLLECTIVE operation
+    // deallocate tmem - tcgen05.dealloc with cta_group::1 needs only warpgroup 0
     __syncthreads();  // Ensure all threads are done before dealloc
-    if (threadIdx.x == 0 && blockIdx.x == 0) printf("[DEBUG] Block 0: All threads deallocating TMEM\n");
-    __syncthreads();  // Reconverge after printf before collective op
+    if (threadIdx.x == 0 && blockIdx.x == 0) printf("[DEBUG] Block 0: Warpgroup 0 deallocating TMEM\n");
+    __syncthreads();  // Reconverge after printf
 
     uint32_t dealloc_num_cols = TMEM_COLS;
-    asm volatile(
-        "tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, %1;"
-        :
-        : "r"(tmem_base), "r"(dealloc_num_cols)
-        : "memory"
-    );
+    // Only first warpgroup (threads 0-127) executes tcgen05.dealloc
+    if (threadIdx.x < 128) {
+        asm volatile(
+            "tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, %1;"
+            :
+            : "r"(tmem_base), "r"(dealloc_num_cols)
+            : "memory"
+        );
+    }
 
     if (threadIdx.x == 0 && blockIdx.x == 0) printf("[DEBUG] Block 0: TMEM deallocated, kernel done!\n");
 }
