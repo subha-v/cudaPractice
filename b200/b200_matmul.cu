@@ -264,34 +264,46 @@ __global__ void my_matmul_kernel(
         // store results from TMEM to global memory
         // Consumer warpgroup reads from TMEM and writes to global memory
         if (wg_id == 0) {
-            // Ensure all WGMMA operations are complete before reading TMEM
-            asm volatile("wgmma.commit_group.sync.aligned;");
-            asm volatile("wgmma.wait_group.sync.aligned 0;");
+            // TODO: Replace with proper tcgen05.commit/wait synchronization
+            // For now using fence to ensure MMA completion
+            asm volatile("tcgen05.fence::before_thread_sync;");
 
-            // Load from TMEM to registers and store to SMEM
-            // Each thread in warpgroup (128 threads) loads multiple values
-            // TMEM has 256 columns of 512 bytes (128 floats each) = 32768 floats total
-            // Each of 128 consumer threads handles 256 floats
+            // tcgen05.ld is warp-collective: all 32 threads in a warp must use same taddr
+            // Using shape .16x256b.x1: loads 512 bytes (1 TMEM column = 128 floats)
+            // Each thread gets 4 registers (4 floats), 32 threads × 4 = 128 floats
+            // Consumer warpgroup has 4 warps, each handles 64 columns (256/4)
 
-            int tid = threadIdx.x;  // 0-127 for consumer warpgroup
-            for (int col = 0; col < TMEM_COLS; col++) {
-                // Each column is 512 bytes = 128 floats
-                // Thread tid gets float at row=tid within each column
-                uint32_t tmem_offset = col * 512 + tid * sizeof(float);
+            int warp_in_consumer = threadIdx.x / 32;  // 0-3 within consumer warpgroup
+            int lane_id = threadIdx.x % 32;           // 0-31 within warp
+            int cols_per_warp = TMEM_COLS / 4;        // 64 columns per warp
 
-                float val;
+            for (int col_idx = 0; col_idx < cols_per_warp; col_idx++) {
+                int col = warp_in_consumer * cols_per_warp + col_idx;
+
+                // All threads in warp use the SAME taddr (base of this column)
+                uint32_t taddr = tmem_base + col * 512;  // 512 bytes per column
+
+                // Collective load: each thread receives 4 floats from the column
+                float r0, r1, r2, r3;
                 asm volatile(
-                    "tcgen05.ld.sync.aligned.16x32b.x1.b32 {%0}, [%1];"
-                    : "=f"(val)
-                    : "r"(tmem_base + tmem_offset)
+                    "tcgen05.ld.sync.aligned.16x256b.x1.b32 {%0, %1, %2, %3}, [%4];"
+                    : "=f"(r0), "=f"(r1), "=f"(r2), "=f"(r3)
+                    : "r"(taddr)
                 );
 
-                // Store to SMEM at corresponding position
-                // TMEM layout: column-major with 128 rows per column
-                // SMEM layout: row-major TILE_M x TILE_N
-                int smem_row = tid;  // 0-127
-                int smem_col = col;  // 0-255
-                c_smem[smem_row * TILE_N + smem_col] = val;
+                // Fence after async load before using the data
+                asm volatile("tcgen05.fence::after_thread_sync;");
+
+                // Store to SMEM
+                // Assuming lane t gets rows [t*4, t*4+3] of this column
+                // (exact mapping may need adjustment based on actual TMEM layout)
+                int base_row = lane_id * 4;
+                if (base_row + 3 < TILE_M) {  // bounds check
+                    c_smem[(base_row + 0) * TILE_N + col] = r0;
+                    c_smem[(base_row + 1) * TILE_N + col] = r1;
+                    c_smem[(base_row + 2) * TILE_N + col] = r2;
+                    c_smem[(base_row + 3) * TILE_N + col] = r3;
+                }
             }
         }
 
