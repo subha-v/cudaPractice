@@ -111,7 +111,7 @@ __global__ void my_matmul_kernel(
     cuda::barrier<cuda::thread_scope_block>* inputs_finished =
         reinterpret_cast<cuda::barrier<cuda::thread_scope_block>*>(inputs_finished_storage);
 
-    // initialization
+    // initialization - barrier init only needs thread 0
     if (threadIdx.x == 0) {
         if (blockIdx.x == 0) printf("[DEBUG] Block 0: Starting barrier init\n");
 
@@ -128,25 +128,25 @@ __global__ void my_matmul_kernel(
                 :: "l"(__cvta_generic_to_shared(finished_ptr)), "r"(2)
             );
         }
-
-        if (blockIdx.x == 0) printf("[DEBUG] Block 0: Barriers initialized, allocating TMEM\n");
-
-        // allocates TMEM for 128x256 float accumulator (256 columns of 512 bytes each)
-        // tcgen05.alloc writes the TMEM address to shared memory at [dst]
-        uint32_t num_cols = TMEM_COLS;
-        uint32_t tmem_base_smem_addr = __cvta_generic_to_shared(&tmem_base);
-        asm volatile(
-            "tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;"
-            :
-            : "r"(tmem_base_smem_addr), "r"(num_cols)
-            : "memory"
-        );
-
-        if (blockIdx.x == 0) printf("[DEBUG] Block 0: TMEM allocated, tmem_base=%u\n", tmem_base);
     }
-    __syncthreads();
+    __syncthreads();  // Ensure barriers are initialized before TMEM alloc
 
-    if (threadIdx.x == 0 && blockIdx.x == 0) printf("[DEBUG] Block 0: Past first syncthreads\n");
+    // TMEM allocation - tcgen05.alloc is a COLLECTIVE operation
+    // All threads must execute it together (.sync.aligned)
+    if (threadIdx.x == 0 && blockIdx.x == 0) printf("[DEBUG] Block 0: All threads allocating TMEM\n");
+
+    uint32_t num_cols = TMEM_COLS;
+    uint32_t tmem_base_smem_addr = __cvta_generic_to_shared(&tmem_base);
+    asm volatile(
+        "tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;"
+        :
+        : "r"(tmem_base_smem_addr), "r"(num_cols)
+        : "memory"
+    );
+    __syncthreads();  // Ensure all threads see the allocated tmem_base
+
+    if (threadIdx.x == 0 && blockIdx.x == 0) printf("[DEBUG] Block 0: TMEM allocated, tmem_base=%u\n", tmem_base);
+    if (threadIdx.x == 0 && blockIdx.x == 0) printf("[DEBUG] Block 0: Past TMEM alloc syncthreads\n");
 
     int num_tiles_m = M / TILE_M;
     int num_tiles_n = N / TILE_N;
@@ -373,18 +373,19 @@ __global__ void my_matmul_kernel(
         if (threadIdx.x == 0 && blockIdx.x == 0 && tile_id == 0) printf("[DEBUG] Block 0: Finished tile_id=0\n");
     }
 
-    // deallocate tmem
-    if (threadIdx.x == 0) {
-        if (blockIdx.x == 0) printf("[DEBUG] Block 0: Deallocating TMEM\n");
-        uint32_t num_cols = TMEM_COLS;
-        asm volatile(
-            "tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, %1;"
-            :
-            : "r"(tmem_base), "r"(num_cols)
-            : "memory"
-        );
-        if (blockIdx.x == 0) printf("[DEBUG] Block 0: TMEM deallocated, kernel done!\n");
-    }
+    // deallocate tmem - tcgen05.dealloc is also a COLLECTIVE operation
+    __syncthreads();  // Ensure all threads are done before dealloc
+    if (threadIdx.x == 0 && blockIdx.x == 0) printf("[DEBUG] Block 0: All threads deallocating TMEM\n");
+
+    uint32_t dealloc_num_cols = TMEM_COLS;
+    asm volatile(
+        "tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, %1;"
+        :
+        : "r"(tmem_base), "r"(dealloc_num_cols)
+        : "memory"
+    );
+
+    if (threadIdx.x == 0 && blockIdx.x == 0) printf("[DEBUG] Block 0: TMEM deallocated, kernel done!\n");
 }
 
 
