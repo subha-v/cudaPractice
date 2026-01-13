@@ -230,15 +230,24 @@ __global__ void my_matmul_kernel(
                                       ((uint64_t)(((TILE_K * 2) >> 4) & 0x3FFF) << 16);
 
                     // enable_input_d: 0 = D = A*B (no accum), 1 = D = A*B + D (accum)
-                    uint32_t enable_d = (k_tile == 0 && k_step == 0) ? 0 : 1;
-
-                    // tcgen05.mma: [d-tmem], a-desc, b-desc, idesc, {mask}, enable_d
-                    asm volatile(
-                        "tcgen05.mma.cta_group::1.kind::f16 [%0], %1, %2, %3, {}, %4;"
-                        :
-                        : "r"(tmem_base), "l"(a_desc), "l"(b_desc), "r"(idesc), "r"(enable_d)
-                        : "memory"
-                    );
+                    // First iteration zeros accumulator, rest accumulate
+                    if (k_tile == 0 && k_step == 0) {
+                        // D = A*B (enable_d = 0, no accumulation)
+                        asm volatile(
+                            "tcgen05.mma.cta_group::1.kind::f16 [%0], %1, %2, %3, 0;"
+                            :
+                            : "r"(tmem_base), "l"(a_desc), "l"(b_desc), "r"(idesc)
+                            : "memory"
+                        );
+                    } else {
+                        // D = A*B + D (enable_d = 1, accumulate)
+                        asm volatile(
+                            "tcgen05.mma.cta_group::1.kind::f16 [%0], %1, %2, %3, 1;"
+                            :
+                            : "r"(tmem_base), "l"(a_desc), "l"(b_desc), "r"(idesc)
+                            : "memory"
+                        );
+                    }
                 }
 
                 // Wait for all MMA operations to complete
