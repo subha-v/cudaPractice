@@ -67,15 +67,16 @@ __device__ __forceinline__ void launch_tma_load(
         : "memory"
     );
 
-    // Launch TMA for matrix B: loads tile [TILE_K x TILE_N] at position (k_tile, tile_col)
+    // Launch TMA for matrix B: loads tile [TILE_K x TILE_N]
+    // B is now column-major (N x K), so coordinate 0 = k_tile (inner), coordinate 1 = tile_col (outer)
     asm volatile(
         "cp.async.bulk.tensor.2d.shared::cluster.global.mbarrier::complete_tx::bytes"
         " [%0], [%1, {%2, %3}], [%4];"
         :
         : "r"((uint32_t)__cvta_generic_to_shared(b_smem[slot])),
           "l"(tensor_map_B),
-          "r"(tile_col),
-          "r"(k_tile),
+          "r"(k_tile),       // coordinate 0: K dimension (inner)
+          "r"(tile_col),     // coordinate 1: N dimension (outer)
           "r"((uint32_t)__cvta_generic_to_shared(barrier))
         : "memory"
     );
@@ -470,17 +471,28 @@ int run_benchmark(size_t M, size_t N, size_t K) {
     __nv_bfloat16* h_A_bf16 = new __nv_bfloat16[M * K];
     __nv_bfloat16* h_B_bf16 = new __nv_bfloat16[K * N];
 
+    // A is row-major (M x K)
     for (size_t i = 0; i < M * K; i++) h_A_bf16[i] = __float2bfloat16(h_A[i]);
-    for (size_t i = 0; i < K * N; i++) h_B_bf16[i] = __float2bfloat16(h_B[i]);
+
+    // B needs to be column-major for TMA (K contiguous, not N)
+    // Original B is K x N row-major: B[k,n] at index k*N + n
+    // Column-major B: B[k,n] at index n*K + k
+    for (size_t k = 0; k < K; k++) {
+        for (size_t n = 0; n < N; n++) {
+            h_B_bf16[n * K + k] = __float2bfloat16(h_B[k * N + n]);
+        }
+    }
 
     cudaMemcpy(d_A, h_A_bf16, M * K * sizeof(__nv_bfloat16), cudaMemcpyHostToDevice);
     cudaMemcpy(d_B, h_B_bf16, K * N * sizeof(__nv_bfloat16), cudaMemcpyHostToDevice);
 
-    std::cout << "Copied matrices to device" << std::endl;
+    std::cout << "Copied matrices to device (B in column-major)" << std::endl;
 
     // Create TMA descriptors
+    // A: M x K row-major, inner dim = K, boxDim[0] = TILE_K = 64 ✓
     CUtensorMap tensor_map_A = create_tensor_map(d_A, M, K, TILE_M, TILE_K);
-    CUtensorMap tensor_map_B = create_tensor_map(d_B, K, N, TILE_K, TILE_N);
+    // B: now N x K column-major (K contiguous), inner dim = K, boxDim[0] = TILE_K = 64 ✓
+    CUtensorMap tensor_map_B = create_tensor_map(d_B, N, K, TILE_N, TILE_K);
 
     std::cout << "Created TMA descriptors" << std::endl;
 
