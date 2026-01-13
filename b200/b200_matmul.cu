@@ -95,9 +95,7 @@ __global__ void my_matmul_kernel(
     // Ring buffer for A and B tiles
     __shared__ __nv_bfloat16 a_smem[PIPE_DEPTH][TILE_M * TILE_K];  // 4 x 128 x 64
     __shared__ __nv_bfloat16 b_smem[PIPE_DEPTH][TILE_K * TILE_N];  // 4 x 64 x 256
-
-    // Output staging buffer in SMEM for TMEM -> global transfer
-    __shared__ float c_smem[TILE_M * TILE_N];  // 128 x 256 floats
+    // Note: No c_smem staging buffer - write directly to global to save SMEM
 
     // TMEM base address for accumulator (allocated per-block)
     __shared__ uint32_t tmem_base;
@@ -279,10 +277,9 @@ __global__ void my_matmul_kernel(
         }
 
         // store results from TMEM to global memory
-        // Consumer warpgroup reads from TMEM and writes to global memory
+        // Consumer warpgroup reads from TMEM and writes directly to global memory
         if (wg_id == 0) {
-            // TODO: Replace with proper tcgen05.commit/wait synchronization
-            // For now using fence to ensure MMA completion
+            // Fence to ensure MMA completion before reading
             asm volatile("tcgen05.fence::before_thread_sync;");
 
             // tcgen05.ld is warp-collective: all 32 threads in a warp must use same taddr
@@ -311,33 +308,19 @@ __global__ void my_matmul_kernel(
                 // Fence after async load before using the data
                 asm volatile("tcgen05.fence::after_thread_sync;");
 
-                // Store to SMEM
+                // Write directly to global memory (no SMEM staging)
                 // Assuming lane t gets rows [t*4, t*4+3] of this column
-                // (exact mapping may need adjustment based on actual TMEM layout)
                 int base_row = lane_id * 4;
-                if (base_row + 3 < TILE_M) {  // bounds check
-                    c_smem[(base_row + 0) * TILE_N + col] = r0;
-                    c_smem[(base_row + 1) * TILE_N + col] = r1;
-                    c_smem[(base_row + 2) * TILE_N + col] = r2;
-                    c_smem[(base_row + 3) * TILE_N + col] = r3;
+                int global_col = tile_col * TILE_N + col;
+
+                if (base_row + 3 < TILE_M) {
+                    int global_row_base = tile_row * TILE_M + base_row;
+                    C[(global_row_base + 0) * N + global_col] = __float2bfloat16(r0);
+                    C[(global_row_base + 1) * N + global_col] = __float2bfloat16(r1);
+                    C[(global_row_base + 2) * N + global_col] = __float2bfloat16(r2);
+                    C[(global_row_base + 3) * N + global_col] = __float2bfloat16(r3);
                 }
             }
-        }
-
-        // All threads sync before reading from c_smem
-        __syncthreads();
-
-        // Now all threads can copy from SMEM to global memory
-        // Each of 256 threads handles 128 elements (32768 / 256 = 128)
-        for (int i = threadIdx.x; i < TILE_M * TILE_N; i += NUM_THREADS) {
-            int local_row = i / TILE_N;
-            int local_col = i % TILE_N;
-            int global_row = tile_row * TILE_M + local_row;
-            int global_col = tile_col * TILE_N + local_col;
-
-            // Read from SMEM and store to global memory
-            float val = c_smem[i];
-            C[global_row * N + global_col] = __float2bfloat16(val);
         }
 
         // Sync before next output tile
