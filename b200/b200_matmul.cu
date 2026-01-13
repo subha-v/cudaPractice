@@ -129,11 +129,14 @@ __global__ void my_matmul_kernel(
         }
 
         // allocates TMEM for 128x256 float accumulator (256 columns of 512 bytes each)
+        // tcgen05.alloc writes the TMEM address to shared memory at [dst]
         uint32_t num_cols = TMEM_COLS;
+        uint32_t tmem_base_smem_addr = __cvta_generic_to_shared(&tmem_base);
         asm volatile(
-            "tcgen05.alloc.cta_group::1.sync.aligned.b32 %0, %1;"
-            : "=r"(tmem_base)
-            : "r"(num_cols)
+            "tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;"
+            :
+            : "r"(tmem_base_smem_addr), "r"(num_cols)
+            : "memory"
         );
     }
     __syncthreads();
@@ -314,8 +317,13 @@ __global__ void my_matmul_kernel(
 
     // deallocate tmem
     if (threadIdx.x == 0) {
-        asm volatile("tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, %1;"
-            :: "r"(tmem_base), "r"(TMEM_COLS));
+        uint32_t num_cols = TMEM_COLS;
+        asm volatile(
+            "tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, %1;"
+            :
+            : "r"(tmem_base), "r"(num_cols)
+            : "memory"
+        );
     }
 }
 
