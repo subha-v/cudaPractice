@@ -354,11 +354,10 @@ CUtensorMap create_tensor_map(
     // Note: TMA uses column-major-ish ordering: {inner_dim, outer_dim}
     cuuint64_t globalDim[2] = {(cuuint64_t)cols, (cuuint64_t)rows};
 
-    // Strides in bytes
-    // For row-major: stride to next column = sizeof(element), stride to next row = cols * sizeof(element)
-    cuuint64_t globalStrides[2] = {
-        sizeof(__nv_bfloat16),                    // Stride for moving one column (inner)
-        (cuuint64_t)cols * sizeof(__nv_bfloat16)  // Stride for moving one row (outer)
+    // Strides in bytes - for rank=2, only need 1 stride (row stride)
+    // The innermost stride (column) is implicit from element size
+    cuuint64_t globalStrides[1] = {
+        (cuuint64_t)cols * sizeof(__nv_bfloat16)  // Stride to next row in bytes
     };
 
     // Tile dimensions
