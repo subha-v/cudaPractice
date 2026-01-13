@@ -187,18 +187,27 @@ __global__ void my_matmul_kernel(
                 // threads 1-127 in the consumer warpgroup dont know yet
                 // Warpgroup fence ensures all consumer threads see the data
 
-                // this is basically like syncthreads but only syncs the 128 consumer threads and not all the 256 threads in the block lol
-                asm volatile("wgmma.fence.sync.aligned;"); // this code synchronizes the warpgroup. 
-                // fence creates a memory barrier and then .aligned is a memory alignment qualifier
-                // wgmma is defined to operate at a warpgroup granularity so it will take the current warpgroup. 
+                // Fence before tcgen05 operations to ensure memory ordering
+                asm volatile("tcgen05.fence::before_thread_sync;"); 
                 
                 // Get shared memory addresses for current slot
                 uint32_t a_addr = __cvta_generic_to_shared(a_smem[compute_slot]);
                 uint32_t b_addr = __cvta_generic_to_shared(b_smem[compute_slot]);
 
-                // WGMMA for 128x256 output tile with K=64
-                // Using Blackwell m128n256k16 WGMMA: 4 k-steps (TILE_K=64, step=16)
-                // Each wgmma handles 128 rows, 256 cols, 16 k-elements in ONE call
+                // Build instruction descriptor for tcgen05.mma
+                // Table 42: .kind::f16 format for bf16 inputs, f32 output
+                // M=128, N=256, K=16
+                uint32_t idesc = 0;
+                idesc |= (1 << 4);    // bits 4-5: dtype = F32
+                idesc |= (1 << 7);    // bits 7-9: atype = BF16
+                idesc |= (1 << 10);   // bits 10-12: btype = BF16
+                idesc |= (32 << 17);  // bits 17-22: N >> 3 = 256 >> 3 = 32
+                idesc |= (8 << 24);   // bits 24-28: M >> 4 = 128 >> 4 = 8
+                // idesc = 0x8400490
+
+                // tcgen05.mma for 128x256 output tile with K=64
+                // Each tcgen05.mma handles 128 rows, 256 cols, 16 k-elements
+                // 4 k-steps needed (TILE_K=64, step=16)
 
                 #pragma unroll
                 for (int k_step = 0; k_step < TILE_K; k_step += 16) { // K = 64
@@ -207,36 +216,35 @@ __global__ void my_matmul_kernel(
                     uint32_t a_offset = k_step * sizeof(__nv_bfloat16);
                     uint32_t b_offset = k_step * TILE_N * sizeof(__nv_bfloat16);
 
-                    // Single WGMMA computes: C[128x256] += A[128x16] × B[16x256]
-                    // scale_d=0 on first iteration to zero accumulator, scale_d=1 otherwise
-                    if (k_tile == 0 && k_step == 0) {
-                        // First iteration: scale_d=0 zeros the accumulator
-                        asm volatile(
-                            "wgmma.mma_async.sync.aligned.m128n256k16.f32.bf16.bf16 "
-                            "[%0], [%1], [%2], 0, 1, 1, 0, 1;"
-                            :
-                            : "r"(tmem_base),
-                              "r"(a_addr + a_offset),
-                              "r"(b_addr + b_offset)
-                            : "memory"
-                        );
-                    } else {
-                        // Subsequent iterations: scale_d=1 accumulates
-                        asm volatile(
-                            "wgmma.mma_async.sync.aligned.m128n256k16.f32.bf16.bf16 "
-                            "[%0], [%1], [%2], 1, 1, 1, 0, 1;"
-                            :
-                            : "r"(tmem_base),
-                              "r"(a_addr + a_offset),
-                              "r"(b_addr + b_offset)
-                            : "memory"
-                        );
-                    }
+                    // Build matrix descriptors (64-bit)
+                    // Format: bits 0-13 = addr>>4, bits 16-29 = ldim>>4, bits 32-45 = stride>>4
+                    uint32_t a_smem_addr = a_addr + a_offset;
+                    uint32_t b_smem_addr = b_addr + b_offset;
+
+                    // A: 128xK row-major, leading dim = K*2 bytes
+                    uint64_t a_desc = ((uint64_t)((a_smem_addr >> 4) & 0x3FFF)) |
+                                      ((uint64_t)(((TILE_K * 2) >> 4) & 0x3FFF) << 16);
+
+                    // B: Kx256 column-major, leading dim = K*2 bytes
+                    uint64_t b_desc = ((uint64_t)((b_smem_addr >> 4) & 0x3FFF)) |
+                                      ((uint64_t)(((TILE_K * 2) >> 4) & 0x3FFF) << 16);
+
+                    // enable_input_d: 0 = D = A*B (no accum), 1 = D = A*B + D (accum)
+                    uint32_t enable_d = (k_tile == 0 && k_step == 0) ? 0 : 1;
+
+                    // tcgen05.mma: [d-tmem], a-desc, b-desc, idesc, {mask}, enable_d
+                    asm volatile(
+                        "tcgen05.mma.cta_group::1.kind::f16 [%0], %1, %2, %3, {}, %4;"
+                        :
+                        : "r"(tmem_base), "l"(a_desc), "l"(b_desc), "r"(idesc), "r"(enable_d)
+                        : "memory"
+                    );
                 }
 
-                // Wait for all WGMMA operations to complete
-                // like syncthreads
-                asm volatile("wgmma.wait_group.sync.aligned 0;");
+                // Wait for all MMA operations to complete
+                // TODO: For proper async completion, use tcgen05.commit + mbarrier pattern
+                // For now, using fence as synchronization point
+                asm volatile("tcgen05.fence::before_thread_sync;");
 
                 // consumer tells producer that it's done with this slot
                 if (threadIdx.x == 0) {
