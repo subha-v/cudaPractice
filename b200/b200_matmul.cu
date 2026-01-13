@@ -366,6 +366,12 @@ CUtensorMap create_tensor_map(
     // Element strides (typically 1)
     cuuint32_t elementStrides[2] = {1, 1};
 
+    // Debug: print TMA parameters
+    std::cout << "TMA params: globalDim={" << globalDim[0] << "," << globalDim[1] << "}"
+              << " boxDim={" << boxDim[0] << "," << boxDim[1] << "}"
+              << " stride=" << globalStrides[0]
+              << " boxDim[0]*sizeof=" << (boxDim[0] * sizeof(__nv_bfloat16)) << " bytes" << std::endl;
+
     // Create the TMA descriptor
     CUresult result = cuTensorMapEncodeTiled(
         &tensor_map,
@@ -377,13 +383,16 @@ CUtensorMap create_tensor_map(
         boxDim,                                  // Tile dimensions
         elementStrides,                          // Element strides
         CU_TENSOR_MAP_INTERLEAVE_NONE,          // No interleaving
-        CU_TENSOR_MAP_SWIZZLE_NONE,             // No swizzling (simpler, but less efficient)
+        CU_TENSOR_MAP_SWIZZLE_NONE,             // No swizzling
         CU_TENSOR_MAP_L2_PROMOTION_NONE,        // L2 promotion setting
         CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE       // Out-of-bounds fill
     );
 
     if (result != CUDA_SUCCESS) {
-        std::cerr << "cuTensorMapEncodeTiled failed with error: " << result << std::endl;
+        std::cerr << "cuTensorMapEncodeTiled FAILED with error: " << result << std::endl;
+        std::cerr << "  Possible issue: boxDim[0]*sizeof(element) = "
+                  << (boxDim[0] * sizeof(__nv_bfloat16))
+                  << " bytes (max 128 bytes for SWIZZLE_NONE)" << std::endl;
     }
 
     return tensor_map;
