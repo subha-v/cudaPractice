@@ -19,17 +19,15 @@ constexpr int TILE_K = 64;
 
 constexpr int NUM_CONSUMERS = 1;
 constexpr int NUM_PRODUCERS = 1;
-constexpr int PIPE_DEPTH = 4;  // Ring buffer depth for pipelining
+constexpr int PIPE_DEPTH = 4;   // 4 slots for the pipeline
 constexpr int NUM_WORKERS = (NUM_CONSUMERS + NUM_PRODUCERS) * 4;  // 4 warps per warpgroup
 constexpr int NUM_THREADS = NUM_WORKERS * 32;  // 32 threads per warp = 256 threads
 
-// TMEM allocation size: 128x256 output tile with float32 accumulators
+
 // Organized in 512-byte columns: 128 * 256 * 4 bytes = 131072 bytes = 256 columns
 constexpr int TMEM_COLS = 256;
 
-// =============================================================================
-// DEVICE HELPER: Launch TMA loads for A and B tiles into a pipeline slot
-// =============================================================================
+// helper function to make tma load from gmem to smem
 __device__ __forceinline__ void launch_tma_load(
     int slot,                                              // Which pipeline slot to load into
     int k_tile,                                            // Which k-tile to load
@@ -42,11 +40,19 @@ __device__ __forceinline__ void launch_tma_load(
     const CUtensorMap* tensor_map_B                        // TMA descriptor for B
 ) {
     // Calculate expected bytes for barrier
-    uint64_t bytes_A = TILE_M * TILE_K * sizeof(__nv_bfloat16);
-    uint64_t bytes_B = TILE_K * TILE_N * sizeof(__nv_bfloat16);
+    uint32_t bytes_A = TILE_M * TILE_K * sizeof(__nv_bfloat16);
+    uint32_t bytes_B = TILE_K * TILE_N * sizeof(__nv_bfloat16);
+    uint32_t expected_bytes = bytes_A + bytes_B;
 
-    // Signal barrier with expected transaction bytes
-    cuda::barrier_arrive_tx(*barrier, 1, bytes_A + bytes_B);
+    // Signal barrier with expected transaction bytes using PTX
+    // This is equivalent to cuda::barrier_arrive_tx(*barrier, 1, expected_bytes)
+    uint64_t barrier_ptr = __cvta_generic_to_shared(barrier);
+    asm volatile(
+        "mbarrier.arrive.expect_tx.shared.b64 _, [%0], %1;"
+        :
+        : "l"(barrier_ptr), "r"(expected_bytes)
+        : "memory"
+    );
 
     // Launch TMA for matrix A: loads tile [TILE_M x TILE_K] at position (tile_row, k_tile)
     asm volatile(
@@ -159,9 +165,6 @@ __global__ void my_matmul_kernel(
                 );
             }
         }
-        // No __syncthreads__ here! Barriers handle synchronization
-
-
         // we split up the tiles of  A and B into further tiles
         // note that each tile of A is 128 x 64 and each tile of B is 64 x 256, where K = 64 (we just set that lol)
         for (int k_tile = 0; k_tile < num_k_tiles; k_tile++) { // i think we have like 32 k tiles for 1024 x 1024
@@ -219,7 +222,7 @@ __global__ void my_matmul_kernel(
 
                 // consumer tells producer that it's done with this slot
                 if (threadIdx.x == 0) {
-                    inputs_finished[compute_slot].arrive();
+                    (void)inputs_finished[compute_slot].arrive();
                 }
             }
 
