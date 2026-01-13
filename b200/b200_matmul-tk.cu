@@ -67,10 +67,12 @@ void matmul(const __grid_constant__ matmul_globals g) {
 
     constexpr int PIPE_DEPTH = 4;
 
-    using a_tile = matmul_globals::a_tile;
+    using a_tile = matmul_globals::a_tile; // Type of 'a' 
     using b_tile = matmul_globals::b_tile;
     using d_tile = matmul_globals::d_tile;
     
+
+    // a_smem is a variable that refers to the 4x2 array shaped chunk that al.allocate finds for us!
     a_tile (&a_smem)[PIPE_DEPTH][NUM_CONSUMERS] = al.allocate<a_tile, PIPE_DEPTH, NUM_CONSUMERS>();
     b_tile (&b_smem)[PIPE_DEPTH]                = al.allocate<b_tile, PIPE_DEPTH>();
     d_tile (&d_smem)                            = al.allocate<d_tile>();
@@ -95,13 +97,18 @@ void matmul(const __grid_constant__ matmul_globals g) {
 
     everyone::tma::cluster::sync();
     
-    if(warpgroupid == NUM_CONSUMERS) {
+    if(warpgroupid == NUM_CONSUMERS) { // PRODUCER GROUP. NOT CONSUMERS.
+
+        // Producers dont need registers by default
         warpgroup::decrease_registers<56>();
-        int ctarank = cluster_ctarank(); 
+
+         // Happens when 2 SMs work together
+        int ctarank = cluster_ctarank();  // This tells us which SM in the cluster we are in, returns 0 or 1
+       
         if(warp::laneid() == 0 && warpgroup::warpid() == 3) {
             int input_ring = 0; // tracking which input block is being loaded
-            for(int task_iter = 0; true; task_iter++) {
-                int2 rowcol = get_task_idx(g, task_iter, false);
+            for(int task_iter = 0; true; task_iter++) { // Infinite for loop because we have a persistent kernel
+                int2 rowcol = get_task_idx(g, task_iter, false); // Maps task_itr to a output tile coordinate (C Coordinate) 
                 if(rowcol.x == -1) {
                     for(int idx = 0; idx < (PIPE_DEPTH); idx++) {
                         tma::cluster::wait(inputs_finished[input_ring], prototype::get_phasebit<1>(bitfield, input_ring));
@@ -123,6 +130,7 @@ void matmul(const __grid_constant__ matmul_globals g) {
             }
         }
         else if(ctarank == 0 && warp::laneid() == 0 && (warpgroup::warpid() == 0 || warpgroup::warpid() == 1)) { // launch the MMA's
+            // Idle threads in the producer warpgroup uses them to issue WGMMA commands
             d_tt_t d_tt = tm_alloc.allocate<d_tt_t>(warpgroup::warpid()*Nb);
             int input_ring = 0; // tracking which input block is being loaded
             for(int task_iter = 0; true; task_iter++) {
@@ -137,7 +145,7 @@ void matmul(const __grid_constant__ matmul_globals g) {
                     tma::cluster::wait(inputs_arrived[input_ring], prototype::get_phasebit<0>(bitfield, input_ring)); // wait while it processes (should take around 100-200 clock cycles)
                     prototype::update_phasebit<0>(bitfield, input_ring);
                     mma2_ABt(d_tt, a_smem[input_ring][warpgroup::warpid()], b_smem[input_ring], inputs_finished[input_ring]);
-                    input_ring=prototype::ring_advance<PIPE_DEPTH>(input_ring);
+                    input_ring=prototype::ring_advance<PIPE_DEPTH>(input_ring); // input_ring = (input_ring + 1) % PIPE_DEPTH
                 }
             }
         }
