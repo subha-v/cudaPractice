@@ -517,8 +517,10 @@ int run_benchmark(size_t M, size_t N, size_t K) {
     std::cout << "Tile sizes: TILE_M=" << TILE_M << ", TILE_N=" << TILE_N << ", TILE_K=" << TILE_K << std::endl;
 
     // Launch configuration
-    const int NUM_BLOCKS = 148;
-    dim3 grid(NUM_BLOCKS, 1);       // 148 blocks (one per SM on B200)
+    // DEBUG: Start with 1 block to verify tcgen05 instructions work
+    // Then increase gradually: 1 -> 4 -> 16 -> 148
+    const int NUM_BLOCKS = 1;
+    dim3 grid(NUM_BLOCKS, 1);       // Reduced for debugging
     dim3 block(NUM_THREADS);        // 256 threads per block (2 warpgroups)
 
     // Checkpoint names for debugging
