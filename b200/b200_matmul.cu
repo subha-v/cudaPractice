@@ -186,8 +186,8 @@ __global__ void my_matmul_kernel(
 
     checkpoint(checkpoint_buffer, 1);  // CHECKPOINT 1: After barrier init
 
-    // TMEM allocation - tcgen05.alloc with cta_group::1 is a COLLECTIVE operation
-    // for exactly 1 warpgroup (128 threads). Only threads 0-127 should execute it.
+    // TMEM allocation - tcgen05.alloc with cta_group::1 is a WARP-collective operation
+    // Only ONE warp (32 threads) should execute it, not a warpgroup!
 
     checkpoint(checkpoint_buffer, 2);  // CHECKPOINT 2: Before TMEM alloc
     __syncthreads();
@@ -197,8 +197,9 @@ __global__ void my_matmul_kernel(
     // generic to shared converts a pointer from generic to a pointer in shared memory
     uint32_t tmem_base_smem_addr = __cvta_generic_to_shared(&tmem_base);
 
-    // Only first warpgroup (threads 0-127) executes tcgen05.alloc
-    if (threadIdx.x < 128) {
+    // Only warp 0 (threads 0-31) executes tcgen05.alloc
+    // Per PTX docs: "When .cta_group::1 is specified, one warp from the CTA must perform the allocation"
+    if (threadIdx.x < 32) {
         asm volatile(
             "tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;"
             :
@@ -403,14 +404,15 @@ __global__ void my_matmul_kernel(
 
     checkpoint(checkpoint_buffer, 5);  // CHECKPOINT 5: After tile processing
 
-    // deallocate tmem - tcgen05.dealloc with cta_group::1 needs only warpgroup 0
+    // deallocate tmem - tcgen05.dealloc with cta_group::1 needs only ONE warp
     __syncthreads();  // Ensure all threads are done before dealloc
 
     checkpoint(checkpoint_buffer, 6);  // CHECKPOINT 6: Before TMEM dealloc
 
     uint32_t dealloc_num_cols = TMEM_COLS;
-    // Only first warpgroup (threads 0-127) executes tcgen05.dealloc
-    if (threadIdx.x < 128) {
+    // Only warp 0 (threads 0-31) executes tcgen05.dealloc
+    // Per PTX docs: "When .cta_group::1 is specified, one warp from the CTA must perform the allocation and de-allocation"
+    if (threadIdx.x < 32) {
         asm volatile(
             "tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, %1;"
             :
