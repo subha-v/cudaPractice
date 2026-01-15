@@ -8,6 +8,51 @@
 #include <cmath>
 #include <omp.h>
 
+// =============================================================================
+// DEBUGGING UTILITIES
+// =============================================================================
+
+// Device-side assert - triggers trap on failure (use with compute-sanitizer)
+__device__ __forceinline__ void dassert(bool condition) {
+    if (!condition) {
+        asm volatile("trap;");
+    }
+}
+
+// Device-side checkpoint marker - writes to global memory for post-mortem analysis
+// checkpoint_buffer should be allocated as: int[gridDim.x * NUM_CHECKPOINTS]
+#define NUM_CHECKPOINTS 16
+__device__ __forceinline__ void checkpoint(int* buffer, int checkpoint_id) {
+    if (threadIdx.x == 0) {
+        buffer[blockIdx.x * NUM_CHECKPOINTS + checkpoint_id] = 1;
+    }
+}
+
+// Host-side CUDA error checking macro
+#define CUDA_CHECK(x) do {                                              \
+    cudaError_t err = (x);                                              \
+    if (err != cudaSuccess) {                                           \
+        fprintf(stderr, "CUDA error %s:%d: %s\n",                       \
+                __FILE__, __LINE__, cudaGetErrorString(err));           \
+        exit(1);                                                        \
+    }                                                                   \
+} while(0)
+
+#define CU_CHECK(x) do {                                                \
+    CUresult err = (x);                                                 \
+    if (err != CUDA_SUCCESS) {                                          \
+        const char* errStr;                                             \
+        cuGetErrorString(err, &errStr);                                 \
+        fprintf(stderr, "CUDA driver error %s:%d: %s\n",                \
+                __FILE__, __LINE__, errStr);                            \
+        exit(1);                                                        \
+    }                                                                   \
+} while(0)
+
+// =============================================================================
+// KERNEL CONSTANTS
+// =============================================================================
+
 // We want to launch 148 blocks and have those persistently running on the B200
 // A kernel is executed as a grid of blocks of threads
 // Each CUDA block is executed by one streaming multiprocessor (SM)
@@ -82,12 +127,25 @@ __device__ __forceinline__ void launch_tma_load(
 }
 
 __global__ void my_matmul_kernel(
-    const __grid_constant__ CUtensorMap tensor_map_A,  
-    const __grid_constant__ CUtensorMap tensor_map_B,  
-    __nv_bfloat16* __restrict__ C,                  
-    int M, int N, int K                            
+    const __grid_constant__ CUtensorMap tensor_map_A,
+    const __grid_constant__ CUtensorMap tensor_map_B,
+    __nv_bfloat16* __restrict__ C,
+    int M, int N, int K,
+    int* checkpoint_buffer  // Debug: tracks execution progress per block
 ) {
-    // what thread am i? producer or consumer and which warp am i in 
+    // Checkpoint IDs:
+    // 0 = kernel entry
+    // 1 = after barrier init
+    // 2 = before TMEM alloc
+    // 3 = after TMEM alloc
+    // 4 = entering tile loop
+    // 5 = after tile processing
+    // 6 = before TMEM dealloc
+    // 7 = kernel exit
+
+    checkpoint(checkpoint_buffer, 0);  // CHECKPOINT 0: Kernel entry
+
+    // what thread am i? producer or consumer and which warp am i in
     int warp_id = threadIdx.x / 32;        // Which warp (0-7 for 256 threads)
     int wg_id = warp_id / 4;               // Which warpgroup (0=consumer, 1=producer)
 
@@ -110,8 +168,6 @@ __global__ void my_matmul_kernel(
 
     // initialization - barrier init only needs thread 0
     if (threadIdx.x == 0) {
-        if (blockIdx.x == 0) printf("[DEBUG] Block 0: Starting barrier init\n");
-
         // Initialize barriers using PTX mbarrier.init
         for (int i = 0; i < PIPE_DEPTH; i++) {
             uint64_t* arrived_ptr = &inputs_arrived_storage[i];
@@ -128,18 +184,20 @@ __global__ void my_matmul_kernel(
     }
     __syncthreads();  // Ensure barriers are initialized before TMEM alloc
 
+    checkpoint(checkpoint_buffer, 1);  // CHECKPOINT 1: After barrier init
+
     // TMEM allocation - tcgen05.alloc with cta_group::1 is a COLLECTIVE operation
     // for exactly 1 warpgroup (128 threads). Only threads 0-127 should execute it.
-    // somehow this is printing but then it hangs after this :((()))
-    if (threadIdx.x == 0 && blockIdx.x == 0) printf("[DEBUG] Block 0: Warpgroup 0 allocating TMEM\n");
-    __syncthreads();  // IMPORTANT: Reconverge after printf ???
+
+    checkpoint(checkpoint_buffer, 2);  // CHECKPOINT 2: Before TMEM alloc
+    __syncthreads();
 
     uint32_t num_cols = TMEM_COLS;
 
-    // generic to shared converts a pointer from generic to a pointer in shared memory? 
+    // generic to shared converts a pointer from generic to a pointer in shared memory
     uint32_t tmem_base_smem_addr = __cvta_generic_to_shared(&tmem_base);
 
-    // Only first warpgroup (threads 0-127) executes tcgen05.alloc - i dont know if this is correct....
+    // Only first warpgroup (threads 0-127) executes tcgen05.alloc
     if (threadIdx.x < 128) {
         asm volatile(
             "tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;"
@@ -150,13 +208,18 @@ __global__ void my_matmul_kernel(
     }
     __syncthreads();  // Ensure all threads see the allocated tmem_base
 
-    // This is currently not printing
-    if (threadIdx.x == 0 && blockIdx.x == 0) printf("[DEBUG] Block 0: TMEM allocated, tmem_base=%u\n", tmem_base);
+    checkpoint(checkpoint_buffer, 3);  // CHECKPOINT 3: After TMEM alloc
+
+    // Assert that TMEM allocation succeeded (tmem_base should be non-zero or valid)
+    // Note: tmem_base == 0 might actually be valid, so this is just for debugging
+    // dassert(tmem_base != 0xFFFFFFFF);  // Uncomment to check for allocation failure
 
     int num_tiles_m = M / TILE_M;
     int num_tiles_n = N / TILE_N;
     int num_k_tiles = K / TILE_K;
     int total_tiles = num_tiles_m * num_tiles_n;
+
+    checkpoint(checkpoint_buffer, 4);  // CHECKPOINT 4: Entering tile loop
 
     // each block processes multiple output tiles
     // note that blockIdx.x  goes from 1 to 148
@@ -171,7 +234,6 @@ __global__ void my_matmul_kernel(
 
         // 1 thread of the producer loads the first tiles
         if (wg_id == 1 && threadIdx.x == 128) {  // First thread of producer warpgroup
-            if (blockIdx.x == 0 && tile_id == 0) printf("[DEBUG] Block 0: Producer starting prefetch\n");
             int prefetch_count = min(PIPE_DEPTH, num_k_tiles); // min (4, tiles) = 4 usually
             for (int k_tile = 0; k_tile < prefetch_count; k_tile++) {
                 int slot = k_tile % PIPE_DEPTH;
@@ -182,9 +244,7 @@ __global__ void my_matmul_kernel(
                     &tensor_map_A, &tensor_map_B
                 );
             }
-            if (blockIdx.x == 0 && tile_id == 0) printf("[DEBUG] Block 0: Producer prefetch done\n");
         }
-        if (threadIdx.x == 0 && blockIdx.x == 0 && tile_id == 0) printf("[DEBUG] Block 0: Entering k_tile loop, num_k_tiles=%d\n", num_k_tiles);
 
         // we split up the tiles of  A and B into further tiles
         // note that each tile of A is 128 x 64 and each tile of B is 64 x 256, where K = 64 (we just set that lol)
@@ -193,15 +253,11 @@ __global__ void my_matmul_kernel(
             int load_k_tile = k_tile + PIPE_DEPTH; // which one to load for the producer
             int load_slot = load_k_tile % PIPE_DEPTH; // which slot to load it into
 
-            if (threadIdx.x == 0 && blockIdx.x == 0 && tile_id == 0 && k_tile < 3) printf("[DEBUG] Block 0: k_tile=%d, compute_slot=%d\n", k_tile, compute_slot);
-
             // consumer thread executes wgmma
             if (wg_id == 0) {
                 // Consumer waits for the producer (only thread 0 does the barrier wait)
                 if (threadIdx.x == 0) {
-                    if (blockIdx.x == 0 && k_tile == 0) printf("[DEBUG] Block 0: Consumer waiting on barrier (k_tile=%d)\n", k_tile);
                     inputs_arrived[compute_slot].arrive_and_wait();
-                    if (blockIdx.x == 0 && k_tile == 0) printf("[DEBUG] Block 0: Consumer past barrier (k_tile=%d)\n", k_tile);
                 }
                 // at this point, only thread 0 does the barrier wait
                 // threads 1-127 in the consumer warpgroup dont know yet
@@ -210,8 +266,6 @@ __global__ void my_matmul_kernel(
                 // Fence before tcgen05 operations to ensure memory ordering
                 asm volatile("tcgen05.fence::before_thread_sync;");
 
-                if (threadIdx.x == 0 && blockIdx.x == 0 && k_tile == 0) printf("[DEBUG] Block 0: Past tcgen05.fence (k_tile=%d)\n", k_tile); 
-                
                 // Get shared memory addresses for current slot
                 uint32_t a_addr = __cvta_generic_to_shared(a_smem[compute_slot]);
                 uint32_t b_addr = __cvta_generic_to_shared(b_smem[compute_slot]);
@@ -225,15 +279,12 @@ __global__ void my_matmul_kernel(
                 idesc |= (1 << 10);   // bits 10-12: btype = BF16
                 idesc |= (32 << 17);  // bits 17-22: N >> 3 = 256 >> 3 = 32
                 idesc |= (8 << 24);   // bits 24-28: M >> 4 = 128 >> 4 = 8
-                // idesc = 0x8400490
 
                 // tcgen05.mma for 128x256 output tile with K=64
                 // Each tcgen05.mma handles 128 rows, 256 cols, 16 k-elements
                 // 4 k-steps needed (TILE_K=64, step=16)
 
-                if (threadIdx.x == 0 && blockIdx.x == 0 && k_tile == 0) printf("[DEBUG] Block 0: Starting tcgen05.mma loop\n");
-
-                 // paragma unroll could be used.. 
+                #pragma unroll
                 for (int k_step = 0; k_step < TILE_K; k_step += 16) { // K = 64
                     // A offset: k_step columns into the 128x64 A tile
                     // B offset: k_step rows into the 64x256 B tile
@@ -253,14 +304,8 @@ __global__ void my_matmul_kernel(
                     uint64_t b_desc = ((uint64_t)((b_smem_addr >> 4) & 0x3FFF)) |
                                       ((uint64_t)(((TILE_K * 2) >> 4) & 0x3FFF) << 16);
 
-                    if (threadIdx.x == 0 && blockIdx.x == 0 && k_tile == 0 && k_step == 0) {
-                        printf("[DEBUG] Block 0: tcgen05.mma params: tmem_base=%u, a_desc=0x%llx, b_desc=0x%llx, idesc=0x%x\n",
-                               tmem_base, (unsigned long long)a_desc, (unsigned long long)b_desc, idesc);
-                    }
-
-                    // first iteration zeros accumulator lol the rest are mm
+                    // first iteration zeros accumulator, the rest accumulate
                     if (k_tile == 0 && k_step == 0) {
-                        if (threadIdx.x == 0 && blockIdx.x == 0) printf("[DEBUG] Block 0: Calling tcgen05.mma (first, no accum)\n");
                         // D = A*B (enable_d = 0, no accumulation)
                         asm volatile(
                             "tcgen05.mma.cta_group::1.kind::f16 [%0], %1, %2, %3, 0;"
@@ -268,7 +313,6 @@ __global__ void my_matmul_kernel(
                             : "r"(tmem_base), "l"(a_desc), "l"(b_desc), "r"(idesc)
                             : "memory"
                         );
-                        if (threadIdx.x == 0 && blockIdx.x == 0) printf("[DEBUG] Block 0: tcgen05.mma returned (first)\n");
                     } else {
                         // D = A*B + D (enable_d = 1, accumulate)
                         asm volatile(
@@ -280,10 +324,7 @@ __global__ void my_matmul_kernel(
                     }
                 }
 
-                if (threadIdx.x == 0 && blockIdx.x == 0 && k_tile == 0) printf("[DEBUG] Block 0: Finished tcgen05.mma loop for k_tile=0\n");
-
                 // Wait for all MMA operations to complete
-                // For now, using fence as synchronization point
                 asm volatile("tcgen05.fence::before_thread_sync;");
 
                 // consumer tells producer that it's done with this slot
@@ -293,7 +334,7 @@ __global__ void my_matmul_kernel(
             }
 
             // Producer loads the next tile (runs in parallel with consumer's WGMMA!)
-            if (wg_id == 1 && threadIdx.x == 128 && load_k_tile < num_k_tiles) { // note that because we didn't use syncthreads and instead use wgmma.fence we can actually move onto this part and not get stuck at syncthreads
+            if (wg_id == 1 && threadIdx.x == 128 && load_k_tile < num_k_tiles) {
                 // Wait for consumer to finish with the slot we're about to reuse
                 if (k_tile >= PIPE_DEPTH) {
                     inputs_finished[load_slot].arrive_and_wait();
@@ -312,8 +353,6 @@ __global__ void my_matmul_kernel(
         // store results from TMEM to global memory
         // Consumer warpgroup reads from TMEM and writes directly to global memory
         if (wg_id == 0) {
-            if (threadIdx.x == 0 && blockIdx.x == 0 && tile_id == 0) printf("[DEBUG] Block 0: Starting store phase\n");
-
             // Fence to ensure MMA completion before reading
             asm volatile("tcgen05.fence::before_thread_sync;");
 
@@ -326,17 +365,11 @@ __global__ void my_matmul_kernel(
             int lane_id = threadIdx.x % 32;           // 0-31 within warp
             int cols_per_warp = TMEM_COLS / 4;        // 64 columns per warp
 
-            if (threadIdx.x == 0 && blockIdx.x == 0 && tile_id == 0) printf("[DEBUG] Block 0: Starting tcgen05.ld loop\n");
-
             for (int col_idx = 0; col_idx < cols_per_warp; col_idx++) {
                 int col = warp_in_consumer * cols_per_warp + col_idx;
 
                 // all threads in warp use the SAME taddr (base of this column)
                 uint32_t taddr = tmem_base + col * 512;  // 512 bytes per column
-
-                if (threadIdx.x == 0 && blockIdx.x == 0 && tile_id == 0 && col_idx == 0) {
-                    printf("[DEBUG] Block 0: tcgen05.ld taddr=%u (col=%d)\n", taddr, col);
-                }
 
                 // Collective load: each thread receives 4 floats from the column
                 float r0, r1, r2, r3;
@@ -345,10 +378,6 @@ __global__ void my_matmul_kernel(
                     : "=f"(r0), "=f"(r1), "=f"(r2), "=f"(r3)
                     : "r"(taddr)
                 );
-
-                if (threadIdx.x == 0 && blockIdx.x == 0 && tile_id == 0 && col_idx == 0) {
-                    printf("[DEBUG] Block 0: tcgen05.ld returned (col=%d)\n", col);
-                }
 
                 // Fence after async load before using the data
                 asm volatile("tcgen05.fence::after_thread_sync;");
@@ -366,23 +395,21 @@ __global__ void my_matmul_kernel(
                     C[(global_row_base + 3) * N + global_col] = __float2bfloat16(r3);
                 }
             }
-
-            if (threadIdx.x == 0 && blockIdx.x == 0 && tile_id == 0) printf("[DEBUG] Block 0: Store phase complete\n");
         }
 
         // Sync before next output tile
         __syncthreads();
-
-        if (threadIdx.x == 0 && blockIdx.x == 0 && tile_id == 0) printf("[DEBUG] Block 0: Finished tile_id=0\n");
     }
+
+    checkpoint(checkpoint_buffer, 5);  // CHECKPOINT 5: After tile processing
 
     // deallocate tmem - tcgen05.dealloc with cta_group::1 needs only warpgroup 0
     __syncthreads();  // Ensure all threads are done before dealloc
-    if (threadIdx.x == 0 && blockIdx.x == 0) printf("[DEBUG] Block 0: Warpgroup 0 deallocating TMEM\n");
-    __syncthreads();  // Reconverge after printf
+
+    checkpoint(checkpoint_buffer, 6);  // CHECKPOINT 6: Before TMEM dealloc
 
     uint32_t dealloc_num_cols = TMEM_COLS;
-    // idk if this is correct. only the first 128 threads do this? 
+    // Only first warpgroup (threads 0-127) executes tcgen05.dealloc
     if (threadIdx.x < 128) {
         asm volatile(
             "tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, %1;"
@@ -392,7 +419,7 @@ __global__ void my_matmul_kernel(
         );
     }
 
-    if (threadIdx.x == 0 && blockIdx.x == 0) printf("[DEBUG] Block 0: TMEM deallocated, kernel done!\n");
+    checkpoint(checkpoint_buffer, 7);  // CHECKPOINT 7: Kernel exit
 }
 
 
@@ -463,15 +490,55 @@ void cpu_gemm(float* a, float* b, float* c, int M, int N, int K) {
     }
 }
 
+// Helper function to print checkpoint results
+void print_checkpoint_results(int* h_checkpoints, int num_blocks, const char* checkpoint_names[]) {
+    std::cout << "\n=== CHECKPOINT RESULTS ===" << std::endl;
+    for (int cp = 0; cp < NUM_CHECKPOINTS; cp++) {
+        int reached_count = 0;
+        for (int b = 0; b < num_blocks; b++) {
+            if (h_checkpoints[b * NUM_CHECKPOINTS + cp]) {
+                reached_count++;
+            }
+        }
+        if (checkpoint_names[cp]) {
+            std::cout << "  Checkpoint " << cp << " (" << checkpoint_names[cp] << "): "
+                      << reached_count << "/" << num_blocks << " blocks" << std::endl;
+        }
+    }
+    std::cout << "==========================\n" << std::endl;
+}
+
 // benchmark
 int run_benchmark(size_t M, size_t N, size_t K) {
     // Initialize CUDA driver API (required for TMA)
-    cuInit(0);
-
-    cudaError_t cudaStatus;
+    CU_CHECK(cuInit(0));
 
     std::cout << "--------------------  M=" << M << " N=" << N << " K=" << K << "  --------------------\n";
     std::cout << "Tile sizes: TILE_M=" << TILE_M << ", TILE_N=" << TILE_N << ", TILE_K=" << TILE_K << std::endl;
+
+    // Launch configuration
+    const int NUM_BLOCKS = 148;
+    dim3 grid(NUM_BLOCKS, 1);       // 148 blocks (one per SM on B200)
+    dim3 block(NUM_THREADS);        // 256 threads per block (2 warpgroups)
+
+    // Checkpoint names for debugging
+    const char* checkpoint_names[NUM_CHECKPOINTS] = {
+        "kernel entry",           // 0
+        "after barrier init",     // 1
+        "before TMEM alloc",      // 2
+        "after TMEM alloc",       // 3
+        "entering tile loop",     // 4
+        "after tile processing",  // 5
+        "before TMEM dealloc",    // 6
+        "kernel exit",            // 7
+        nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr
+    };
+
+    // Allocate checkpoint buffer (device + host)
+    int* d_checkpoints;
+    int* h_checkpoints = new int[NUM_BLOCKS * NUM_CHECKPOINTS]();
+    CUDA_CHECK(cudaMalloc(&d_checkpoints, NUM_BLOCKS * NUM_CHECKPOINTS * sizeof(int)));
+    CUDA_CHECK(cudaMemset(d_checkpoints, 0, NUM_BLOCKS * NUM_CHECKPOINTS * sizeof(int)));
 
     // Allocate host memory
     float* h_A = new float[M * K];
@@ -500,15 +567,9 @@ int run_benchmark(size_t M, size_t N, size_t K) {
 
     // Allocate device memory
     __nv_bfloat16 *d_A, *d_B, *d_C;
-    cudaMalloc(&d_A, M * K * sizeof(__nv_bfloat16));
-    cudaMalloc(&d_B, K * N * sizeof(__nv_bfloat16));
-    cudaMalloc(&d_C, M * N * sizeof(__nv_bfloat16));
-
-    cudaStatus = cudaGetLastError();
-    if (cudaStatus != cudaSuccess) {
-        std::cerr << "CUDA error: " << cudaGetErrorString(cudaStatus) << std::endl;
-        return -1;
-    }
+    CUDA_CHECK(cudaMalloc(&d_A, M * K * sizeof(__nv_bfloat16)));
+    CUDA_CHECK(cudaMalloc(&d_B, K * N * sizeof(__nv_bfloat16)));
+    CUDA_CHECK(cudaMalloc(&d_C, M * N * sizeof(__nv_bfloat16)));
 
     std::cout << "Allocated device memory" << std::endl;
 
@@ -520,57 +581,50 @@ int run_benchmark(size_t M, size_t N, size_t K) {
     for (size_t i = 0; i < M * K; i++) h_A_bf16[i] = __float2bfloat16(h_A[i]);
 
     // B needs to be column-major for TMA (K contiguous, not N)
-  
     for (size_t k = 0; k < K; k++) {
         for (size_t n = 0; n < N; n++) {
             h_B_bf16[n * K + k] = __float2bfloat16(h_B[k * N + n]);
         }
     }
 
-    cudaMemcpy(d_A, h_A_bf16, M * K * sizeof(__nv_bfloat16), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_B, h_B_bf16, K * N * sizeof(__nv_bfloat16), cudaMemcpyHostToDevice);
+    CUDA_CHECK(cudaMemcpy(d_A, h_A_bf16, M * K * sizeof(__nv_bfloat16), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_B, h_B_bf16, K * N * sizeof(__nv_bfloat16), cudaMemcpyHostToDevice));
 
     std::cout << "Copied matrices to device (B in column-major)" << std::endl;
 
     // Create TMA descriptors
-    // A: M x K row-major, inner dim = K, boxDim[0] = TILE_K = 64 
+    // A: M x K row-major, inner dim = K, boxDim[0] = TILE_K = 64
     CUtensorMap tensor_map_A = create_tensor_map(d_A, M, K, TILE_M, TILE_K);
-    // B: now N x K column-major (K contiguous), inner dim = K, boxDim[0] = TILE_K = 64 
+    // B: now N x K column-major (K contiguous), inner dim = K, boxDim[0] = TILE_K = 64
     CUtensorMap tensor_map_B = create_tensor_map(d_B, N, K, TILE_N, TILE_K);
 
     std::cout << "Created TMA descriptors" << std::endl;
-
-    // Launch configuration
-    dim3 grid(148, 1);       // 148 blocks (one per SM on B200)
-    dim3 block(NUM_THREADS); // 256 threads per block (2 warpgroups)
-
     std::cout << "Launching kernel with grid(" << grid.x << "), block(" << block.x << ")" << std::endl;
 
-    // Kernel can request up to this many bytes of SMEM
-    cudaFuncSetAttribute(my_matmul_kernel,
-                         cudaFuncAttributeMaxDynamicSharedMemorySize,
-                         196608);  
+    // Reset checkpoint buffer before kernel launch
+    CUDA_CHECK(cudaMemset(d_checkpoints, 0, NUM_BLOCKS * NUM_CHECKPOINTS * sizeof(int)));
 
-    // Warmup run
-    std::cout << "Warmup..." << std::endl;
-    my_matmul_kernel<<<grid, block>>>(tensor_map_A, tensor_map_B, d_C, M, N, K);
-    cudaDeviceSynchronize();
+    // Warmup/debug run
+    std::cout << "Running kernel..." << std::endl;
+    my_matmul_kernel<<<grid, block>>>(tensor_map_A, tensor_map_B, d_C, M, N, K, d_checkpoints);
+    CUDA_CHECK(cudaGetLastError());  // Check for launch errors
+    CUDA_CHECK(cudaDeviceSynchronize());  // Wait and check for execution errors
 
-    cudaStatus = cudaGetLastError();
-    if (cudaStatus != cudaSuccess) {
-        std::cerr << "Kernel failed: " << cudaGetErrorString(cudaStatus) << std::endl;
-        return -1;
-    }
+    // Copy checkpoint results back to host
+    CUDA_CHECK(cudaMemcpy(h_checkpoints, d_checkpoints, NUM_BLOCKS * NUM_CHECKPOINTS * sizeof(int), cudaMemcpyDeviceToHost));
 
-    // Benchmark runs
+    // Print checkpoint results
+    print_checkpoint_results(h_checkpoints, NUM_BLOCKS, checkpoint_names);
+
+    // Benchmark runs (only if warmup succeeded)
     constexpr int ITERS = 5;
-    cudaDeviceSynchronize();
+    CUDA_CHECK(cudaDeviceSynchronize());
     auto start = std::chrono::high_resolution_clock::now();
 
     for (int i = 0; i < ITERS; i++) {
-        my_matmul_kernel<<<grid, block>>>(tensor_map_A, tensor_map_B, d_C, M, N, K);
+        my_matmul_kernel<<<grid, block>>>(tensor_map_A, tensor_map_B, d_C, M, N, K, d_checkpoints);
     }
-    cudaDeviceSynchronize();
+    CUDA_CHECK(cudaDeviceSynchronize());
 
     auto end = std::chrono::high_resolution_clock::now();
 
@@ -585,16 +639,9 @@ int run_benchmark(size_t M, size_t N, size_t K) {
     std::cout << "Avg Kernel execution time: " << useconds << " us\n";
     std::cout << "Achieved performance: " << tflops << " TFLOPs\n";
 
-    // Check for CUDA errors
-    cudaStatus = cudaGetLastError();
-    if (cudaStatus != cudaSuccess) {
-        std::cerr << "CUDA error: " << cudaGetErrorString(cudaStatus) << std::endl;
-        return -1;
-    }
-
     // Copy result back to host
     __nv_bfloat16* h_C_bf16 = new __nv_bfloat16[M * N];
-    cudaMemcpy(h_C_bf16, d_C, M * N * sizeof(__nv_bfloat16), cudaMemcpyDeviceToHost);
+    CUDA_CHECK(cudaMemcpy(h_C_bf16, d_C, M * N * sizeof(__nv_bfloat16), cudaMemcpyDeviceToHost));
 
     // Convert result back to float for comparison
     for (size_t i = 0; i < M * N; i++) h_C[i] = __bfloat162float(h_C_bf16[i]);
@@ -633,9 +680,11 @@ int run_benchmark(size_t M, size_t N, size_t K) {
     delete[] h_A_bf16;
     delete[] h_B_bf16;
     delete[] h_C_bf16;
-    cudaFree(d_A);
-    cudaFree(d_B);
-    cudaFree(d_C);
+    delete[] h_checkpoints;
+    CUDA_CHECK(cudaFree(d_A));
+    CUDA_CHECK(cudaFree(d_B));
+    CUDA_CHECK(cudaFree(d_C));
+    CUDA_CHECK(cudaFree(d_checkpoints));
 
     std::cout << "Done!\n" << std::endl;
 
@@ -643,11 +692,12 @@ int run_benchmark(size_t M, size_t N, size_t K) {
 }
 
 int main() {
-    // Run benchmarks at different sizes
+    // Run single benchmark for debugging
+    // Uncomment additional sizes once the kernel works correctly
     run_benchmark(1024, 1024, 1024);
-    run_benchmark(2048, 2048, 2048);
-    run_benchmark(4096, 4096, 4096);
-    run_benchmark(8192, 8192, 8192);
+    // run_benchmark(2048, 2048, 2048);
+    // run_benchmark(4096, 4096, 4096);
+    // run_benchmark(8192, 8192, 8192);
 
     return 0;
 }
