@@ -151,8 +151,9 @@ __global__ void my_matmul_kernel(
 
     // smem allocation
     // Ring buffer for A and B tiles
-    __shared__ __nv_bfloat16 a_smem[PIPE_DEPTH][TILE_M * TILE_K];  // 4 x 128 x 64 =  65,536 bytes
-    __shared__ __nv_bfloat16 b_smem[PIPE_DEPTH][TILE_K * TILE_N];  // 4 x 64 x 256 = 131,072 bytes
+    // TMA requires 128-byte alignment for shared memory destinations
+    __shared__ __align__(128) __nv_bfloat16 a_smem[PIPE_DEPTH][TILE_M * TILE_K];  // 4 x 128 x 64 x 2 = 65,536 bytes
+    __shared__ __align__(128) __nv_bfloat16 b_smem[PIPE_DEPTH][TILE_K * TILE_N];  // 4 x 64 x 256 x 2 = 131,072 bytes
 
     __shared__ uint32_t tmem_base;
 
