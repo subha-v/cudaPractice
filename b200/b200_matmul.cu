@@ -93,8 +93,8 @@ __global__ void my_matmul_kernel(
 
     // smem allocation
     // Ring buffer for A and B tiles
-    __shared__ __nv_bfloat16 a_smem[PIPE_DEPTH][TILE_M * TILE_K];  // 4 x 128 x 64
-    __shared__ __nv_bfloat16 b_smem[PIPE_DEPTH][TILE_K * TILE_N];  // 4 x 64 x 256
+    __shared__ __nv_bfloat16 a_smem[PIPE_DEPTH][TILE_M * TILE_K];  // 4 x 128 x 64 =  65,536 bytes
+    __shared__ __nv_bfloat16 b_smem[PIPE_DEPTH][TILE_K * TILE_N];  // 4 x 64 x 256 = 131,072 bytes
 
     __shared__ uint32_t tmem_base;
 
@@ -546,10 +546,10 @@ int run_benchmark(size_t M, size_t N, size_t K) {
 
     std::cout << "Launching kernel with grid(" << grid.x << "), block(" << block.x << ")" << std::endl;
 
-    // Maximize dynamic shared memory for the kernel (TMA/TMEM kernels need more)
+    // Kernel can request up to this many bytes of SMEM
     cudaFuncSetAttribute(my_matmul_kernel,
                          cudaFuncAttributeMaxDynamicSharedMemorySize,
-                         98304); // Set to max (~100KB on B200)
+                         196608);  
 
     // Warmup run
     std::cout << "Warmup..." << std::endl;
