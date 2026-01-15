@@ -99,9 +99,9 @@ __device__ __forceinline__ void launch_tma_load(
         : "memory"
     );
 
-    //launch tma for a - use shared::cta instead of shared::cluster (no cluster configured)
+    // Launch TMA for A - explicitly specify .tile mode for sm_100a compatibility
     asm volatile(
-        "cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes"
+        "cp.async.bulk.tensor.2d.shared::cta.global.tile.mbarrier::complete_tx::bytes"
         " [%0], [%1, {%2, %3}], [%4];"
         :
         : "r"((uint32_t)__cvta_generic_to_shared(a_smem[slot])),
@@ -112,9 +112,9 @@ __device__ __forceinline__ void launch_tma_load(
         : "memory"
     );
 
-    // launch tma for b - use shared::cta instead of shared::cluster
+    // Launch TMA for B - explicitly specify .tile mode for sm_100a compatibility
     asm volatile(
-        "cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes"
+        "cp.async.bulk.tensor.2d.shared::cta.global.tile.mbarrier::complete_tx::bytes"
         " [%0], [%1, {%2, %3}], [%4];"
         :
         : "r"((uint32_t)__cvta_generic_to_shared(b_smem[slot])),
