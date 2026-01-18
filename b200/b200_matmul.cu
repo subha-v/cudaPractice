@@ -351,8 +351,6 @@ __global__ void my_matmul_kernel(
                         }
                     }
 
-                    // Commit the MMA operations
-                    asm volatile("tcgen05.commit.cta_group::1;");
                 }
 
                 // All consumer threads sync before signaling completion
@@ -384,12 +382,10 @@ __global__ void my_matmul_kernel(
         // store results from TMEM to global memory
         // Consumer warpgroup reads from TMEM and writes directly to global memory
         if (wg_id == 0) {
-            // Wait for all MMA operations to complete before reading from TMEM
-            // tcgen05.wait waits for all prior tcgen05 operations (including mma) to complete
-            if (threadIdx.x == 0) {
-                asm volatile("tcgen05.wait::st.cta_group::1;");
-            }
-            __syncwarp();
+            // Fence to ensure all prior tcgen05 operations (MMA) complete before reading
+            // tcgen05.fence::before_thread_sync ensures memory ordering
+            asm volatile("tcgen05.fence::before_thread_sync;");
+            __syncthreads();  // Ensure all threads see the fence
 
             // tcgen05.ld is warp-collective: all 32 threads in a warp must use same taddr
             // using shape .16x256b.x1: loads 512 bytes (1 TMEM column = 128 floats)
