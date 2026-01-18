@@ -255,81 +255,110 @@ __global__ void my_matmul_kernel(
             int load_k_tile = k_tile + PIPE_DEPTH; // which one to load for the producer
             int load_slot = load_k_tile % PIPE_DEPTH; // which slot to load it into
 
-            // consumer thread executes wgmma
+            // Consumer warpgroup waits for data, but ONLY ONE THREAD issues tcgen05.mma
+            // tcgen05.mma is NOT warpgroup-collective like WGMMA - only 1 thread executes it!
             if (wg_id == 0) {
-                // Consumer waits for the producer (only thread 0 does the barrier wait)
+                // All threads in consumer warpgroup wait for data to arrive
                 if (threadIdx.x == 0) {
                     inputs_arrived[compute_slot].arrive_and_wait();
                 }
-                // at this point, only thread 0 does the barrier wait
-                // threads 1-127 in the consumer warpgroup dont know yet
-                // Warpgroup fence ensures all consumer threads see the data
+                __syncwarp();  // Ensure all threads in warp 0 know data is ready
 
-                // Fence before tcgen05 operations to ensure memory ordering
-                asm volatile("tcgen05.fence::before_thread_sync;");
+                // Only thread 0 of the entire CTA issues the tcgen05.mma instruction
+                // Per NVIDIA docs: "Unlike WGMMA, only one thread is used to launch UMMA"
+                if (threadIdx.x == 0) {
+                    // Fence before tcgen05 operations to ensure memory ordering
+                    asm volatile("tcgen05.fence::before_thread_sync;");
 
-                // Get shared memory addresses for current slot
-                uint32_t a_addr = __cvta_generic_to_shared(a_smem[compute_slot]);
-                uint32_t b_addr = __cvta_generic_to_shared(b_smem[compute_slot]);
+                    // Get shared memory addresses for current slot
+                    uint32_t a_addr = __cvta_generic_to_shared(a_smem[compute_slot]);
+                    uint32_t b_addr = __cvta_generic_to_shared(b_smem[compute_slot]);
 
-                // Build instruction descriptor for tcgen05.mma
-                // Table 42: .kind::f16 format for bf16 inputs, f32 output
-                // M=128, N=256, K=16
-                uint32_t idesc = 0;
-                idesc |= (1 << 4);    // bits 4-5: dtype = F32
-                idesc |= (1 << 7);    // bits 7-9: atype = BF16
-                idesc |= (1 << 10);   // bits 10-12: btype = BF16
-                idesc |= (32 << 17);  // bits 17-22: N >> 3 = 256 >> 3 = 32
-                idesc |= (8 << 24);   // bits 24-28: M >> 4 = 128 >> 4 = 8
+                    // Build instruction descriptor for tcgen05.mma
+                    // Table 42: .kind::f16 format for bf16 inputs, f32 output
+                    // M=128, N=256, K=16
+                    uint32_t idesc = 0;
+                    idesc |= (1 << 4);    // bits 4-5: dtype = F32
+                    idesc |= (1 << 7);    // bits 7-9: atype = BF16
+                    idesc |= (1 << 10);   // bits 10-12: btype = BF16
+                    idesc |= (32 << 17);  // bits 17-22: N >> 3 = 256 >> 3 = 32
+                    idesc |= (8 << 24);   // bits 24-28: M >> 4 = 128 >> 4 = 8
 
-                // tcgen05.mma for 128x256 output tile with K=64
-                // Each tcgen05.mma handles 128 rows, 256 cols, 16 k-elements
-                // 4 k-steps needed (TILE_K=64, step=16)
+                    // tcgen05.mma for 128x256 output tile with K=64
+                    // Each tcgen05.mma handles 128 rows, 256 cols, 16 k-elements
+                    // Need 4 k-steps (TILE_K=64, step=16)
 
-                #pragma unroll
-                for (int k_step = 0; k_step < TILE_K; k_step += 16) { // K = 64
-                    // A offset: k_step columns into the 128x64 A tile
-                    // B offset: k_step rows into the 64x256 B tile
-                    uint32_t a_offset = k_step * sizeof(__nv_bfloat16);
-                    uint32_t b_offset = k_step * TILE_N * sizeof(__nv_bfloat16);
+                    // SMEM descriptor format (64-bit):
+                    // bits 0-13:  base address >> 4
+                    // bits 16-29: LBO (leading byte offset) - stride in K dimension
+                    // bits 32-45: SBO (stride byte offset) - stride in M/N dimension
+                    // bits 61-63: swizzle mode (0 = none)
 
-                    // Build matrix descriptors (64-bit)
-                    // Format: bits 0-13 = addr>>4, bits 16-29 = ldim>>4, bits 32-45 = stride>>4
-                    uint32_t a_smem_addr = a_addr + a_offset;
-                    uint32_t b_smem_addr = b_addr + b_offset;
+                    // For A (128 x 64 bf16, row-major):
+                    //   - LBO = stride to next K element = 2 bytes (adjacent in memory)
+                    //   - SBO = stride to next M row = TILE_K * 2 = 128 bytes
+                    // For B (64 x 256 bf16, stored column-major as 256 x 64):
+                    //   - LBO = stride to next K element = 2 bytes (adjacent)
+                    //   - SBO = stride to next N column = TILE_K * 2 = 128 bytes
 
-                    // a desc
-                    uint64_t a_desc = ((uint64_t)((a_smem_addr >> 4) & 0x3FFF)) |
-                                      ((uint64_t)(((TILE_K * 2) >> 4) & 0x3FFF) << 16);
+                    #pragma unroll
+                    for (int k_step = 0; k_step < TILE_K; k_step += 16) {
+                        // A offset: k_step columns into the 128x64 A tile
+                        // B offset: k_step rows into the 64x256 B tile
+                        uint32_t a_offset = k_step * sizeof(__nv_bfloat16);
+                        uint32_t b_offset = k_step * sizeof(__nv_bfloat16);  // B is K-major
 
-                    // b desc
-                    uint64_t b_desc = ((uint64_t)((b_smem_addr >> 4) & 0x3FFF)) |
-                                      ((uint64_t)(((TILE_K * 2) >> 4) & 0x3FFF) << 16);
+                        uint32_t a_smem_addr = a_addr + a_offset;
+                        uint32_t b_smem_addr = b_addr + b_offset;
 
-                    // first iteration zeros accumulator, the rest accumulate
-                    if (k_tile == 0 && k_step == 0) {
-                        // D = A*B (enable_d = 0, no accumulation)
-                        asm volatile(
-                            "tcgen05.mma.cta_group::1.kind::f16 [%0], %1, %2, %3, 0;"
-                            :
-                            : "r"(tmem_base), "l"(a_desc), "l"(b_desc), "r"(idesc)
-                            : "memory"
-                        );
-                    } else {
-                        // D = A*B + D (enable_d = 1, accumulate)
-                        asm volatile(
-                            "tcgen05.mma.cta_group::1.kind::f16 [%0], %1, %2, %3, 1;"
-                            :
-                            : "r"(tmem_base), "l"(a_desc), "l"(b_desc), "r"(idesc)
-                            : "memory"
-                        );
+                        // A descriptor: 128 rows x K bf16
+                        // LBO = 16 bytes (8 bf16 elements, core matrix width)
+                        // SBO = TILE_K * 2 = 128 bytes (stride to next row of 8 rows)
+                        uint64_t a_lbo = 16;   // Core matrix is 8 elements wide = 16 bytes
+                        uint64_t a_sbo = TILE_K * sizeof(__nv_bfloat16);  // 128 bytes
+
+                        uint64_t a_desc = ((uint64_t)(a_smem_addr) & 0x3FFFF) |
+                                          ((a_lbo & 0x3FFF) << 16) |
+                                          ((a_sbo & 0x3FFF) << 32);
+
+                        // B descriptor: K x 256 bf16 (K-major)
+                        // LBO = 16 bytes (core matrix width)
+                        // SBO = TILE_K * 2 = 128 bytes (stride to next column group)
+                        uint64_t b_lbo = 16;
+                        uint64_t b_sbo = TILE_K * sizeof(__nv_bfloat16);  // 128 bytes
+
+                        uint64_t b_desc = ((uint64_t)(b_smem_addr) & 0x3FFFF) |
+                                          ((b_lbo & 0x3FFF) << 16) |
+                                          ((b_sbo & 0x3FFF) << 32);
+
+                        // First iteration zeros accumulator, the rest accumulate
+                        if (k_tile == 0 && k_step == 0) {
+                            // D = A*B (enable_d = 0, no accumulation)
+                            asm volatile(
+                                "tcgen05.mma.cta_group::1.kind::f16 [%0], %1, %2, %3, 0;"
+                                :
+                                : "r"(tmem_base), "l"(a_desc), "l"(b_desc), "r"(idesc)
+                                : "memory"
+                            );
+                        } else {
+                            // D = A*B + D (enable_d = 1, accumulate)
+                            asm volatile(
+                                "tcgen05.mma.cta_group::1.kind::f16 [%0], %1, %2, %3, 1;"
+                                :
+                                : "r"(tmem_base), "l"(a_desc), "l"(b_desc), "r"(idesc)
+                                : "memory"
+                            );
+                        }
                     }
+
+                    // Commit the MMA operations
+                    asm volatile("tcgen05.commit.cta_group::1;");
                 }
 
-                // Wait for all MMA operations to complete
-                asm volatile("tcgen05.fence::before_thread_sync;");
+                // All consumer threads sync before signaling completion
+                __syncwarp();
 
-                // consumer tells producer that it's done with this slot
+                // Consumer tells producer that it's done with this slot
                 if (threadIdx.x == 0) {
                     (void)inputs_finished[compute_slot].arrive();
                 }
@@ -355,8 +384,12 @@ __global__ void my_matmul_kernel(
         // store results from TMEM to global memory
         // Consumer warpgroup reads from TMEM and writes directly to global memory
         if (wg_id == 0) {
-            // Fence to ensure MMA completion before reading
-            asm volatile("tcgen05.fence::before_thread_sync;");
+            // Wait for all MMA operations to complete before reading from TMEM
+            // tcgen05.wait waits for all prior tcgen05 operations (including mma) to complete
+            if (threadIdx.x == 0) {
+                asm volatile("tcgen05.wait::st.cta_group::1;");
+            }
+            __syncwarp();
 
             // tcgen05.ld is warp-collective: all 32 threads in a warp must use same taddr
             // using shape .16x256b.x1: loads 512 bytes (1 TMEM column = 128 floats)
@@ -381,8 +414,8 @@ __global__ void my_matmul_kernel(
                     : "r"(taddr)
                 );
 
-                // Fence after async load before using the data
-                asm volatile("tcgen05.fence::after_thread_sync;");
+                // Wait for tcgen05.ld to complete before using data
+                asm volatile("tcgen05.wait::ld.sync.aligned;");
 
                 // Write directly to global memory (no SMEM staging)
                 // Assuming lane t gets rows [t*4, t*4+3] of this column
