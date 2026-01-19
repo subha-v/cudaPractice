@@ -214,9 +214,17 @@ __global__ void my_matmul_kernel(
 
     checkpoint(checkpoint_buffer, 3);  // CHECKPOINT 3: After TMEM alloc
 
-    // Assert that TMEM allocation succeeded (tmem_base should be non-zero or valid)
-    // Note: tmem_base == 0 might actually be valid, so this is just for debugging
-    // dassert(tmem_base != 0xFFFFFFFF);  // Uncomment to check for allocation failure
+    // DEBUG: Print tmem_base value to see if allocation succeeded
+    if (threadIdx.x == 0) {
+        printf("DEBUG: tmem_base = %u (0x%x)\n", tmem_base, tmem_base);
+        if (tmem_base == 0) {
+            printf("WARNING: tmem_base is 0 - allocation may have failed!\n");
+        }
+        if (tmem_base == 0xFFFFFFFF) {
+            printf("ERROR: tmem_base is 0xFFFFFFFF - allocation explicitly failed!\n");
+        }
+    }
+    __syncthreads();  // Sync after debug print
 
     int num_tiles_m = M / TILE_M;
     int num_tiles_n = N / TILE_N;
