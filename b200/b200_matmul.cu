@@ -331,21 +331,35 @@ __global__ void my_matmul_kernel(
                                           ((b_lbo & 0x3FFF) << 16) |
                                           ((b_sbo & 0x3FFF) << 32);
 
+                        // tcgen05.mma format (from PTX docs):
+                        // tcgen05.mma.cta_group::1.kind::f16 [d-tmem], a-desc, b-desc, idesc,
+                        //                                    {disable-output-lane x4}, enable-input-d;
+                        // - disable-output-lane: 4 x 32-bit masks (0 = don't disable)
+                        // - enable-input-d: predicate (0 = D=A*B, 1 = D=A*B+D)
+
                         // First iteration zeros accumulator, the rest accumulate
                         if (k_tile == 0 && k_step == 0) {
-                            // D = A*B (enable_d = 0, no accumulation)
+                            // D = A*B (enable_d = false, no accumulation)
                             asm volatile(
-                                "tcgen05.mma.cta_group::1.kind::f16 [%0], %1, %2, %3, 0;"
+                                "{\n\t"
+                                ".reg .pred p;\n\t"
+                                "setp.eq.u32 p, 0, 1;\n\t"  // p = false
+                                "tcgen05.mma.cta_group::1.kind::f16 [%0], %1, %2, %3, {%4, %4, %4, %4}, p;\n\t"
+                                "}"
                                 :
-                                : "r"(tmem_base), "l"(a_desc), "l"(b_desc), "r"(idesc)
+                                : "r"(tmem_base), "l"(a_desc), "l"(b_desc), "r"(idesc), "r"(0)
                                 : "memory"
                             );
                         } else {
-                            // D = A*B + D (enable_d = 1, accumulate)
+                            // D = A*B + D (enable_d = true, accumulate)
                             asm volatile(
-                                "tcgen05.mma.cta_group::1.kind::f16 [%0], %1, %2, %3, 1;"
+                                "{\n\t"
+                                ".reg .pred p;\n\t"
+                                "setp.eq.u32 p, 1, 1;\n\t"  // p = true
+                                "tcgen05.mma.cta_group::1.kind::f16 [%0], %1, %2, %3, {%4, %4, %4, %4}, p;\n\t"
+                                "}"
                                 :
-                                : "r"(tmem_base), "l"(a_desc), "l"(b_desc), "r"(idesc)
+                                : "r"(tmem_base), "l"(a_desc), "l"(b_desc), "r"(idesc), "r"(0)
                                 : "memory"
                             );
                         }
@@ -379,13 +393,15 @@ __global__ void my_matmul_kernel(
 
         }
 
+        // Sync all threads before TMEM read phase
+        __syncthreads();
+
         // store results from TMEM to global memory
         // Consumer warpgroup reads from TMEM and writes directly to global memory
         if (wg_id == 0) {
             // Fence to ensure all prior tcgen05 operations (MMA) complete before reading
             // tcgen05.fence::before_thread_sync ensures memory ordering
             asm volatile("tcgen05.fence::before_thread_sync;");
-            __syncthreads();  // Ensure all threads see the fence
 
             // tcgen05.ld is warp-collective: all 32 threads in a warp must use same taddr
             // using shape .16x256b.x1: loads 512 bytes (1 TMEM column = 128 floats)
