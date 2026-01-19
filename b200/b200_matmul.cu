@@ -74,15 +74,15 @@ constexpr int TMEM_COLS = 256;
 
 // helper function to make tma load from gmem to smem
 __device__ __forceinline__ void launch_tma_load(
-    int slot,                                             
-    int k_tile,                                         
-    int tile_row,                                        
-    int tile_col,                                         
-    __nv_bfloat16 a_smem[][TILE_M * TILE_K],            
-    __nv_bfloat16 b_smem[][TILE_K * TILE_N],            
+    int slot,
+    int k_tile,
+    int tile_row,
+    int tile_col,
+    __nv_bfloat16 a_smem[][TILE_M * TILE_K],
+    __nv_bfloat16 b_smem[][TILE_K * TILE_N],
     cuda::barrier<cuda::thread_scope_block>* barrier,      // which barrier to signal
-    const CUtensorMap* tensor_map_A,                     
-    const CUtensorMap* tensor_map_B                  
+    const CUtensorMap* tensor_map_A,
+    const CUtensorMap* tensor_map_B
 ) {
     // Calculate expected bytes for barrier
     uint32_t bytes_A = TILE_M * TILE_K * sizeof(__nv_bfloat16);
@@ -90,7 +90,6 @@ __device__ __forceinline__ void launch_tma_load(
     uint32_t expected_bytes = bytes_A + bytes_B;
 
     // Signal barrier with expected transaction bytes using PTX
-
     uint64_t barrier_ptr = __cvta_generic_to_shared(barrier);
     asm volatile(
         "mbarrier.arrive.expect_tx.shared.b64 _, [%0], %1;"
@@ -99,28 +98,37 @@ __device__ __forceinline__ void launch_tma_load(
         : "memory"
     );
 
+    // TMA expects ELEMENT coordinates, not tile indices!
+    // Convert tile indices to element coordinates
+    int a_coord_k = k_tile * TILE_K;      // K dimension element coordinate
+    int a_coord_m = tile_row * TILE_M;    // M dimension element coordinate
+    int b_coord_k = k_tile * TILE_K;      // K dimension element coordinate
+    int b_coord_n = tile_col * TILE_N;    // N dimension element coordinate
+
     // Launch TMA for A - explicitly specify .tile mode for sm_100a compatibility
+    // A tensor map: globalDim={K, M}, so coords are {k_coord, m_coord}
     asm volatile(
         "cp.async.bulk.tensor.2d.shared::cta.global.tile.mbarrier::complete_tx::bytes"
         " [%0], [%1, {%2, %3}], [%4];"
         :
         : "r"((uint32_t)__cvta_generic_to_shared(a_smem[slot])),
           "l"(tensor_map_A),
-          "r"(k_tile),
-          "r"(tile_row),
+          "r"(a_coord_k),     // coordinate 0: K dimension (element coord)
+          "r"(a_coord_m),     // coordinate 1: M dimension (element coord)
           "r"((uint32_t)__cvta_generic_to_shared(barrier))
         : "memory"
     );
 
     // Launch TMA for B - explicitly specify .tile mode for sm_100a compatibility
+    // B tensor map: globalDim={K, N}, so coords are {k_coord, n_coord}
     asm volatile(
         "cp.async.bulk.tensor.2d.shared::cta.global.tile.mbarrier::complete_tx::bytes"
         " [%0], [%1, {%2, %3}], [%4];"
         :
         : "r"((uint32_t)__cvta_generic_to_shared(b_smem[slot])),
           "l"(tensor_map_B),
-          "r"(k_tile),       // coordinate 0: K dimension (inner)
-          "r"(tile_col),     // coordinate 1: N dimension (outer)
+          "r"(b_coord_k),     // coordinate 0: K dimension (element coord)
+          "r"(b_coord_n),     // coordinate 1: N dimension (element coord)
           "r"((uint32_t)__cvta_generic_to_shared(barrier))
         : "memory"
     );
