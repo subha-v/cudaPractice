@@ -80,7 +80,7 @@ __device__ __forceinline__ void launch_tma_load(
     int tile_col,
     __nv_bfloat16 a_smem[][TILE_M * TILE_K],
     __nv_bfloat16 b_smem[][TILE_K * TILE_N],
-    cuda::barrier<cuda::thread_scope_block>* barrier,      // which barrier to signal
+    uint64_t* barrier,      // raw mbarrier storage pointer
     const CUtensorMap* tensor_map_A,
     const CUtensorMap* tensor_map_B
 ) {
@@ -90,11 +90,11 @@ __device__ __forceinline__ void launch_tma_load(
     uint32_t expected_bytes = bytes_A + bytes_B;
 
     // Signal barrier with expected transaction bytes using PTX
-    uint64_t barrier_ptr = __cvta_generic_to_shared(barrier);
+    uint64_t barrier_addr = __cvta_generic_to_shared(barrier);
     asm volatile(
         "mbarrier.arrive.expect_tx.shared.b64 _, [%0], %1;"
         :
-        : "l"(barrier_ptr), "r"(expected_bytes)
+        : "l"(barrier_addr), "r"(expected_bytes)
         : "memory"
     );
 
@@ -115,7 +115,7 @@ __device__ __forceinline__ void launch_tma_load(
           "l"(tensor_map_A),
           "r"(a_coord_k),     // coordinate 0: K dimension (element coord)
           "r"(a_coord_m),     // coordinate 1: M dimension (element coord)
-          "r"((uint32_t)__cvta_generic_to_shared(barrier))
+          "r"((uint32_t)barrier_addr)
         : "memory"
     );
 
@@ -129,7 +129,7 @@ __device__ __forceinline__ void launch_tma_load(
           "l"(tensor_map_B),
           "r"(b_coord_k),     // coordinate 0: K dimension (element coord)
           "r"(b_coord_n),     // coordinate 1: N dimension (element coord)
-          "r"((uint32_t)__cvta_generic_to_shared(barrier))
+          "r"((uint32_t)barrier_addr)
         : "memory"
     );
 }
@@ -165,15 +165,9 @@ __global__ void my_matmul_kernel(
 
     __shared__ uint32_t tmem_base;
 
-    // barriers
+    // barriers - raw PTX mbarrier storage (NOT cuda::barrier - they're incompatible!)
     __shared__ alignas(8) uint64_t inputs_arrived_storage[PIPE_DEPTH];
     __shared__ alignas(8) uint64_t inputs_finished_storage[PIPE_DEPTH];
-
-    // cast to barrier pointers
-    cuda::barrier<cuda::thread_scope_block>* inputs_arrived =
-        reinterpret_cast<cuda::barrier<cuda::thread_scope_block>*>(inputs_arrived_storage);
-    cuda::barrier<cuda::thread_scope_block>* inputs_finished =
-        reinterpret_cast<cuda::barrier<cuda::thread_scope_block>*>(inputs_finished_storage);
 
     // initialization - barrier init only needs thread 0
     if (threadIdx.x == 0) {
@@ -250,7 +244,7 @@ __global__ void my_matmul_kernel(
                 launch_tma_load( // loads in tiles A and B to SMEM
                     slot, k_tile, tile_row, tile_col,
                     a_smem, b_smem,
-                    &inputs_arrived[slot],
+                    &inputs_arrived_storage[slot],  // raw mbarrier storage
                     &tensor_map_A, &tensor_map_B
                 );
             }
@@ -267,8 +261,31 @@ __global__ void my_matmul_kernel(
             // tcgen05.mma is NOT warpgroup-collective like WGMMA - only 1 thread executes it!
             if (wg_id == 0) {
                 // All threads in consumer warpgroup wait for data to arrive
+                // Use PTX mbarrier operations (not C++ cuda::barrier) for consistency
                 if (threadIdx.x == 0) {
-                    inputs_arrived[compute_slot].arrive_and_wait();
+                    uint64_t* barrier_ptr = &inputs_arrived_storage[compute_slot];
+                    uint64_t barrier_addr = __cvta_generic_to_shared(barrier_ptr);
+
+                    // Arrive and wait using PTX
+                    // Phase bit alternates 0,1,0,1... for each use of the barrier
+                    uint32_t phase = (k_tile / PIPE_DEPTH) & 1;
+
+                    // First arrive
+                    asm volatile(
+                        "mbarrier.arrive.shared.b64 _, [%0];"
+                        :: "l"(barrier_addr) : "memory"
+                    );
+
+                    // Then wait for phase completion
+                    asm volatile(
+                        "{\n\t"
+                        ".reg .pred p;\n\t"
+                        "WAIT_LOOP:\n\t"
+                        "mbarrier.try_wait.parity.shared.b64 p, [%0], %1;\n\t"
+                        "@!p bra WAIT_LOOP;\n\t"
+                        "}"
+                        :: "l"(barrier_addr), "r"(phase) : "memory"
+                    );
                 }
                 __syncwarp();  // Ensure all threads in warp 0 know data is ready
 
@@ -378,9 +395,14 @@ __global__ void my_matmul_kernel(
                 // All consumer threads sync before signaling completion
                 __syncwarp();
 
-                // Consumer tells producer that it's done with this slot
+                // Consumer tells producer that it's done with this slot (PTX arrive)
                 if (threadIdx.x == 0) {
-                    (void)inputs_finished[compute_slot].arrive();
+                    uint64_t* barrier_ptr = &inputs_finished_storage[compute_slot];
+                    uint64_t barrier_addr = __cvta_generic_to_shared(barrier_ptr);
+                    asm volatile(
+                        "mbarrier.arrive.shared.b64 _, [%0];"
+                        :: "l"(barrier_addr) : "memory"
+                    );
                 }
             }
 
@@ -388,13 +410,36 @@ __global__ void my_matmul_kernel(
             if (wg_id == 1 && threadIdx.x == 128 && load_k_tile < num_k_tiles) {
                 // Wait for consumer to finish with the slot we're about to reuse
                 if (k_tile >= PIPE_DEPTH) {
-                    inputs_finished[load_slot].arrive_and_wait();
+                    uint64_t* barrier_ptr = &inputs_finished_storage[load_slot];
+                    uint64_t barrier_addr = __cvta_generic_to_shared(barrier_ptr);
+
+                    // Phase bit for this barrier
+                    // First wait on slot 0 happens at k_tile=4, phase should be 0
+                    // Second wait on slot 0 happens at k_tile=8, phase should be 1
+                    uint32_t phase = ((k_tile - PIPE_DEPTH) / PIPE_DEPTH) & 1;
+
+                    // First arrive
+                    asm volatile(
+                        "mbarrier.arrive.shared.b64 _, [%0];"
+                        :: "l"(barrier_addr) : "memory"
+                    );
+
+                    // Then wait for phase completion
+                    asm volatile(
+                        "{\n\t"
+                        ".reg .pred p;\n\t"
+                        "WAIT_LOOP2:\n\t"
+                        "mbarrier.try_wait.parity.shared.b64 p, [%0], %1;\n\t"
+                        "@!p bra WAIT_LOOP2;\n\t"
+                        "}"
+                        :: "l"(barrier_addr), "r"(phase) : "memory"
+                    );
                 }
 
                 launch_tma_load(
                     load_slot, load_k_tile, tile_row, tile_col,
                     a_smem, b_smem,
-                    &inputs_arrived[load_slot],
+                    &inputs_arrived_storage[load_slot],  // raw mbarrier storage
                     &tensor_map_A, &tensor_map_B
                 );
             }
