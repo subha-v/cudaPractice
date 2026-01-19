@@ -197,6 +197,21 @@ __global__ void my_matmul_kernel(
 
     uint32_t num_cols = TMEM_COLS;
 
+    // DEBUG: Print shared memory address before alloc
+    if (threadIdx.x == 0) {
+        uint32_t smem_addr_debug = __cvta_generic_to_shared(&tmem_base);
+        printf("DEBUG: smem_addr for tmem_base = %u (0x%x)\n", smem_addr_debug, smem_addr_debug);
+        printf("DEBUG: num_cols = %u\n", num_cols);
+
+        // Test: manually write to tmem_base to verify shared memory works
+        tmem_base = 0xDEADBEEF;
+        printf("DEBUG: After manual write, tmem_base = 0x%x\n", tmem_base);
+
+        // Reset for actual alloc
+        tmem_base = 0;
+    }
+    __syncthreads();
+
     // tcgen05.alloc writes the allocated TMEM address to shared memory at [dst]
     // Per PTX docs: "When .cta_group::1 is specified, one warp from the CTA must perform the allocation"
     // All 32 threads in warp 0 must execute this instruction (it's warp-collective)
