@@ -215,15 +215,24 @@ __global__ void my_matmul_kernel(
     // tcgen05.alloc writes the allocated TMEM address to shared memory at [dst]
     // Per PTX docs: "When .cta_group::1 is specified, one warp from the CTA must perform the allocation"
     // All 32 threads in warp 0 must execute this instruction (it's warp-collective)
+    // The PTX examples show using ld.shared.b32 to read the result after alloc
     if (threadIdx.x < 32) {
         // Get shared memory address where result will be written
         uint32_t smem_addr = __cvta_generic_to_shared(&tmem_base);
+        uint32_t taddr_result;
         asm volatile(
-            "tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;"
-            :
+            "{\n\t"
+            "tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%1], %2;\n\t"
+            "ld.shared.b32 %0, [%1];\n\t"
+            "}"
+            : "=r"(taddr_result)
             : "r"(smem_addr), "r"(num_cols)
             : "memory"
         );
+        // Thread 0 writes back to shared variable
+        if (threadIdx.x == 0) {
+            tmem_base = taddr_result;
+        }
     }
     __syncthreads();  // Ensure all threads see the allocated tmem_base
 
