@@ -197,18 +197,21 @@ __global__ void my_matmul_kernel(
 
     uint32_t num_cols = TMEM_COLS;
 
-    // generic to shared converts a pointer from generic to a pointer in shared memory
-    uint32_t tmem_base_smem_addr = __cvta_generic_to_shared(&tmem_base);
-
     // Only warp 0 (threads 0-31) executes tcgen05.alloc
     // Per PTX docs: "When .cta_group::1 is specified, one warp from the CTA must perform the allocation"
+    // Using register-based output (like CUTLASS) instead of shared memory output
     if (threadIdx.x < 32) {
+        uint32_t tmem_addr_result;
         asm volatile(
-            "tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;"
-            :
-            : "r"(tmem_base_smem_addr), "r"(num_cols)
+            "tcgen05.alloc.cta_group::1.sync.aligned.b32 %0, %1;"
+            : "=r"(tmem_addr_result)
+            : "r"(num_cols)
             : "memory"
         );
+        // Only one thread writes to shared memory to avoid race
+        if (threadIdx.x == 0) {
+            tmem_base = tmem_addr_result;
+        }
     }
     __syncthreads();  // Ensure all threads see the allocated tmem_base
 
