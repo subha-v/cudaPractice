@@ -70,7 +70,7 @@ constexpr int NUM_THREADS = NUM_WORKERS * 32;  // 32 threads per warp = 256 thre
 
 
 // Organized in 512-byte columns: 128 * 256 * 4 bytes = 131072 bytes = 256 columns
-constexpr int TMEM_COLS = 256;
+constexpr int TMEM_COLS = 8; // TESTING SMALLER ALLOCATION
 
 // helper function to make tma load from gmem to smem
 __device__ __forceinline__ void launch_tma_load(
@@ -218,11 +218,17 @@ __global__ void my_matmul_kernel(
     // The PTX examples show using ld.shared.b32 to read the result after alloc
     if (threadIdx.x >= 32 && threadIdx.x < 64) {  // warp 1
         const int addr = static_cast<int>(__cvta_generic_to_shared(tmem_base));
+        if (threadIdx.x == 32) {
+            printf("DEBUG: Warp 1 executing tcgen05.alloc with addr=0x%x, num_cols=%u\n", addr, num_cols);
+        }
         asm volatile(
             "tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;"
             :: "r"(addr), "r"(num_cols)
             : "memory"
         );
+        if (threadIdx.x == 32) {
+            printf("DEBUG: Warp 1 completed tcgen05.alloc, tmem_base[0]=%u (0x%x)\n", tmem_base[0], tmem_base[0]);
+        }
     }
     __syncthreads();  // Ensure all threads see the allocated tmem_base
 
