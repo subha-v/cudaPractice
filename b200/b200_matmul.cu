@@ -172,16 +172,18 @@ __global__ __cluster_dims__(1, 1, 1) void my_matmul_kernel(
     // initialization - barrier init only needs thread 0
     if (threadIdx.x == 0) {
         // Initialize barriers using PTX mbarrier.init
+        // inputs_arrived: 1 arrival (producer's expect_tx, TMA completion is via tx_count)
+        // inputs_finished: 1 arrival (consumer signals done)
         for (int i = 0; i < PIPE_DEPTH; i++) {
             uint64_t* arrived_ptr = &inputs_arrived_storage[i];
             uint64_t* finished_ptr = &inputs_finished_storage[i];
             asm volatile(
                 "mbarrier.init.shared.b64 [%0], %1;"
-                :: "l"(__cvta_generic_to_shared(arrived_ptr)), "r"(2)
+                :: "l"(__cvta_generic_to_shared(arrived_ptr)), "r"(1)
             );
             asm volatile(
                 "mbarrier.init.shared.b64 [%0], %1;"
-                :: "l"(__cvta_generic_to_shared(finished_ptr)), "r"(2)
+                :: "l"(__cvta_generic_to_shared(finished_ptr)), "r"(1)
             );
         }
     }
@@ -276,6 +278,9 @@ __global__ __cluster_dims__(1, 1, 1) void my_matmul_kernel(
             }
         }
 
+        // Ensure prefetch TMA loads are issued before consumer starts waiting
+        __syncthreads();
+
         // we split up the tiles of  A and B into further tiles
         // note that each tile of A is 128 x 64 and each tile of B is 64 x 256, where K = 64 (we just set that lol)
         for (int k_tile = 0; k_tile < num_k_tiles; k_tile++) { // i think we have like 32 k tiles for 1024 x 1024
@@ -286,23 +291,18 @@ __global__ __cluster_dims__(1, 1, 1) void my_matmul_kernel(
             // Consumer warpgroup waits for data, but ONLY ONE THREAD issues tcgen05.mma
             // tcgen05.mma is NOT warpgroup-collective like WGMMA - only 1 thread executes it!
             if (wg_id == 0) {
-                // All threads in consumer warpgroup wait for data to arrive
-                // Use PTX mbarrier operations (not C++ cuda::barrier) for consistency
+                // Thread 0 waits for TMA data to arrive (producer signals via expect_tx)
+                // Consumer does NOT arrive - only waits! The barrier is signaled by:
+                //   1. Producer's mbarrier.arrive.expect_tx
+                //   2. TMA hardware completion
                 if (threadIdx.x == 0) {
                     uint64_t* barrier_ptr = &inputs_arrived_storage[compute_slot];
                     uint64_t barrier_addr = __cvta_generic_to_shared(barrier_ptr);
 
-                    // Arrive and wait using PTX
                     // Phase bit alternates 0,1,0,1... for each use of the barrier
                     uint32_t phase = (k_tile / PIPE_DEPTH) & 1;
 
-                    // First arrive
-                    asm volatile(
-                        "mbarrier.arrive.shared.b64 _, [%0];"
-                        :: "l"(barrier_addr) : "memory"
-                    );
-
-                    // Then wait for phase completion
+                    // Wait for TMA completion (no arrive - producer already signaled)
                     asm volatile(
                         "{\n\t"
                         ".reg .pred p;\n\t"
@@ -444,13 +444,7 @@ __global__ __cluster_dims__(1, 1, 1) void my_matmul_kernel(
                     // Second wait on slot 0 happens at k_tile=8, phase should be 1
                     uint32_t phase = ((k_tile - PIPE_DEPTH) / PIPE_DEPTH) & 1;
 
-                    // First arrive
-                    asm volatile(
-                        "mbarrier.arrive.shared.b64 _, [%0];"
-                        :: "l"(barrier_addr) : "memory"
-                    );
-
-                    // Then wait for phase completion
+                    // Producer only waits - consumer signals via arrive
                     asm volatile(
                         "{\n\t"
                         ".reg .pred p;\n\t"
