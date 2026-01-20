@@ -163,7 +163,7 @@ __global__ void my_matmul_kernel(
     __shared__ __align__(128) __nv_bfloat16 a_smem[PIPE_DEPTH][TILE_M * TILE_K];  // 4 x 128 x 64 x 2 = 65,536 bytes
     __shared__ __align__(128) __nv_bfloat16 b_smem[PIPE_DEPTH][TILE_K * TILE_N];  // 4 x 64 x 256 x 2 = 131,072 bytes
 
-    __shared__ uint32_t tmem_base;
+    __shared__ int tmem_base[1];  // tmem address is 32-bit
 
     // barriers - raw PTX mbarrier storage (NOT cuda::barrier - they're incompatible!)
     __shared__ alignas(8) uint64_t inputs_arrived_storage[PIPE_DEPTH];
@@ -199,16 +199,16 @@ __global__ void my_matmul_kernel(
 
     // DEBUG: Print shared memory address before alloc
     if (threadIdx.x == 0) {
-        uint32_t smem_addr_debug = __cvta_generic_to_shared(&tmem_base);
+        uint32_t smem_addr_debug = __cvta_generic_to_shared(tmem_base);
         printf("DEBUG: smem_addr for tmem_base = %u (0x%x)\n", smem_addr_debug, smem_addr_debug);
         printf("DEBUG: num_cols = %u\n", num_cols);
 
         // Test: manually write to tmem_base to verify shared memory works
-        tmem_base = 0xDEADBEEF;
-        printf("DEBUG: After manual write, tmem_base = 0x%x\n", tmem_base);
+        tmem_base[0] = 0xDEADBEEF;
+        printf("DEBUG: After manual write, tmem_base = 0x%x\n", tmem_base[0]);
 
         // Reset for actual alloc
-        tmem_base = 0;
+        tmem_base[0] = 0;
     }
     __syncthreads();
 
@@ -217,22 +217,12 @@ __global__ void my_matmul_kernel(
     // All 32 threads in warp 0 must execute this instruction (it's warp-collective)
     // The PTX examples show using ld.shared.b32 to read the result after alloc
     if (threadIdx.x < 32) {
-        // Get shared memory address where result will be written
-        uint32_t smem_addr = __cvta_generic_to_shared(&tmem_base);
-        uint32_t taddr_result;
+        const int addr = static_cast<int>(__cvta_generic_to_shared(tmem_base));
         asm volatile(
-            "{\n\t"
-            "tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%1], %2;\n\t"
-            "ld.shared.b32 %0, [%1];\n\t"
-            "}"
-            : "=r"(taddr_result)
-            : "r"(smem_addr), "r"(num_cols)
+            "tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;"
+            :: "r"(addr), "r"(num_cols)
             : "memory"
         );
-        // Thread 0 writes back to shared variable
-        if (threadIdx.x == 0) {
-            tmem_base = taddr_result;
-        }
     }
     __syncthreads();  // Ensure all threads see the allocated tmem_base
 
@@ -240,11 +230,11 @@ __global__ void my_matmul_kernel(
 
     // DEBUG: Print tmem_base value to see if allocation succeeded
     if (threadIdx.x == 0) {
-        printf("DEBUG: tmem_base = %u (0x%x)\n", tmem_base, tmem_base);
-        if (tmem_base == 0) {
+        printf("DEBUG: tmem_base = %u (0x%x)\n", tmem_base[0], tmem_base[0]);
+        if (tmem_base[0] == 0) {
             printf("WARNING: tmem_base is 0 - allocation may have failed!\n");
         }
-        if (tmem_base == 0xFFFFFFFF) {
+        if (tmem_base[0] == 0xFFFFFFFF) {
             printf("ERROR: tmem_base is 0xFFFFFFFF - allocation explicitly failed!\n");
         }
     }
@@ -404,7 +394,7 @@ __global__ void my_matmul_kernel(
                                 "tcgen05.mma.cta_group::1.kind::f16 [%0], %1, %2, %3, {%4, %4, %4, %4}, p;\n\t"
                                 "}"
                                 :
-                                : "r"(tmem_base), "l"(a_desc), "l"(b_desc), "r"(idesc), "r"(0)
+                                : "r"(tmem_base[0]), "l"(a_desc), "l"(b_desc), "r"(idesc), "r"(0)
                                 : "memory"
                             );
                         } else {
@@ -416,7 +406,7 @@ __global__ void my_matmul_kernel(
                                 "tcgen05.mma.cta_group::1.kind::f16 [%0], %1, %2, %3, {%4, %4, %4, %4}, p;\n\t"
                                 "}"
                                 :
-                                : "r"(tmem_base), "l"(a_desc), "l"(b_desc), "r"(idesc), "r"(0)
+                                : "r"(tmem_base[0]), "l"(a_desc), "l"(b_desc), "r"(idesc), "r"(0)
                                 : "memory"
                             );
                         }
@@ -505,7 +495,7 @@ __global__ void my_matmul_kernel(
                 int col = warp_in_consumer * cols_per_warp + col_idx;
 
                 // all threads in warp use the SAME taddr (base of this column)
-                uint32_t taddr = tmem_base + col * 512;  // 512 bytes per column
+                uint32_t taddr = tmem_base[0] + col * 512;  // 512 bytes per column
 
                 // Collective load: each thread receives 4 floats from the column
                 float r0, r1, r2, r3;
@@ -551,7 +541,7 @@ __global__ void my_matmul_kernel(
         asm volatile(
             "tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, %1;"
             :
-            : "r"(tmem_base), "r"(dealloc_num_cols)
+            : "r"(tmem_base[0]), "r"(dealloc_num_cols)
             : "memory"
         );
     }
