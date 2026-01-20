@@ -175,12 +175,14 @@ __global__ __cluster_dims__(1, 1, 1) void my_matmul_kernel(
     // barriers - raw PTX mbarrier storage (NOT cuda::barrier - they're incompatible!)
     __shared__ alignas(8) uint64_t inputs_arrived_storage[PIPE_DEPTH];
     __shared__ alignas(8) uint64_t inputs_finished_storage[PIPE_DEPTH];
+    __shared__ alignas(8) uint64_t mma_mbar[1];  // For async MMA completion tracking
 
     // initialization - barrier init only needs thread 0
     if (threadIdx.x == 0) {
         // Initialize barriers using PTX mbarrier.init
         // inputs_arrived: 1 arrival (producer's expect_tx, TMA completion is via tx_count)
         // inputs_finished: 1 arrival (consumer signals done)
+        // mma_mbar: 1 arrival (tcgen05.commit signals when MMA completes)
         for (int i = 0; i < PIPE_DEPTH; i++) {
             uint64_t* arrived_ptr = &inputs_arrived_storage[i];
             uint64_t* finished_ptr = &inputs_finished_storage[i];
@@ -193,6 +195,11 @@ __global__ __cluster_dims__(1, 1, 1) void my_matmul_kernel(
                 :: "l"(__cvta_generic_to_shared(finished_ptr)), "r"(1)
             );
         }
+        // Initialize MMA completion barrier
+        asm volatile(
+            "mbarrier.init.shared.b64 [%0], %1;"
+            :: "l"(__cvta_generic_to_shared(mma_mbar)), "r"(1)
+        );
         // CRITICAL: Make barrier init visible to async proxy (TMA hardware)
         asm volatile("fence.mbarrier_init.release.cluster;");
     }
@@ -231,6 +238,10 @@ __global__ __cluster_dims__(1, 1, 1) void my_matmul_kernel(
     int num_tiles_n = N / TILE_N;
     int num_k_tiles = K / TILE_K;
     int total_tiles = num_tiles_m * num_tiles_n;
+
+    // MMA completion tracking - shared memory address for mbarrier
+    const uint32_t mma_mbar_addr = static_cast<uint32_t>(__cvta_generic_to_shared(mma_mbar));
+    int mma_phase = 0;  // Alternates 0,1,0,1... for each k_tile
 
     checkpoint(checkpoint_buffer, 4);  // CHECKPOINT 4: Entering tile loop
 
@@ -391,6 +402,12 @@ __global__ __cluster_dims__(1, 1, 1) void my_matmul_kernel(
                         }
                     }
 
+                    // ASYNC MMA COMPLETION: tcgen05.commit signals mbarrier when MMA finishes
+                    // This is NON-BLOCKING - thread continues immediately, hardware signals later
+                    asm volatile(
+                        "tcgen05.commit.cta_group::1.mbarrier::arrive::one.shared::cluster.b64 [%0];"
+                        :: "r"(mma_mbar_addr) : "memory"
+                    );
                 }
 
                 // All consumer threads sync before signaling completion
@@ -447,14 +464,26 @@ __global__ __cluster_dims__(1, 1, 1) void my_matmul_kernel(
                 );
             }
 
+            // Wait for MMA completion (signaled by tcgen05.commit)
+            // This wait allows proper pipelining - we issue MMA+commit, then wait
+            // All threads must wait since they all need to know MMA is complete
+            if (threadIdx.x == 0) {
+                asm volatile(
+                    "{\n\t"
+                    ".reg .pred p;\n\t"
+                    "MMA_WAIT_LOOP:\n\t"
+                    "mbarrier.try_wait.parity.shared::cta.b64 p, [%0], %1;\n\t"
+                    "@!p bra MMA_WAIT_LOOP;\n\t"
+                    "}"
+                    :: "r"(mma_mbar_addr), "r"(mma_phase) : "memory"
+                );
+            }
+            mma_phase ^= 1;  // Flip phase for next k_tile
         }
 
-        // Thread 0 must wait for MMA to complete BEFORE syncing with other threads
-        // tcgen05.fence only waits for ops "issued by the executing thread"
-        // So only thread 0 (which issued the MMA) can wait for its completion
-        if (threadIdx.x == 0) {
-            asm volatile("tcgen05.fence::before_thread_sync;");
-        }
+        // Fence required after all MMAs complete, before reading from TMEM
+        // tcgen05.fence ensures all tcgen05 operations issued by this thread are complete
+        asm volatile("tcgen05.fence::after_thread_sync;");
 
         // Now sync all threads - after this, all threads know MMA is complete
         __syncthreads();
@@ -844,11 +873,10 @@ int run_benchmark(size_t M, size_t N, size_t K) {
 }
 
 int main() {
-    // Run benchmarks with increasing sizes
-    run_benchmark(1024, 1024, 1024);
-    run_benchmark(2048, 2048, 2048);
-    run_benchmark(4096, 4096, 4096);
+    // Run benchmarks with same sizes as TK kernel for comparison
+    // TK only tests 8192 and 16384 since small sizes don't saturate GPU
     run_benchmark(8192, 8192, 8192);
+    run_benchmark(16384, 16384, 16384);
 
     return 0;
 }
