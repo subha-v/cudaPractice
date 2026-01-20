@@ -90,11 +90,12 @@ __device__ __forceinline__ void launch_tma_load(
     uint32_t expected_bytes = bytes_A + bytes_B;
 
     // Signal barrier with expected transaction bytes using PTX
-    uint64_t barrier_addr = __cvta_generic_to_shared(barrier);
+    // Use .release.cta.shared::cta qualifiers for proper memory ordering
+    uint32_t barrier_addr = static_cast<uint32_t>(__cvta_generic_to_shared(barrier));
     asm volatile(
-        "mbarrier.arrive.expect_tx.shared.b64 _, [%0], %1;"
+        "mbarrier.arrive.expect_tx.release.cta.shared::cta.b64 _, [%0], %1;"
         :
-        : "l"(barrier_addr), "r"(expected_bytes)
+        : "r"(barrier_addr), "r"(expected_bytes)
         : "memory"
     );
 
@@ -186,6 +187,8 @@ __global__ __cluster_dims__(1, 1, 1) void my_matmul_kernel(
                 :: "l"(__cvta_generic_to_shared(finished_ptr)), "r"(1)
             );
         }
+        // CRITICAL: Make barrier init visible to async proxy (TMA hardware)
+        asm volatile("fence.mbarrier_init.release.cluster;");
     }
     __syncthreads();  // Ensure barriers are initialized before TMEM alloc
 
@@ -297,7 +300,7 @@ __global__ __cluster_dims__(1, 1, 1) void my_matmul_kernel(
                 //   2. TMA hardware completion
                 if (threadIdx.x == 0) {
                     uint64_t* barrier_ptr = &inputs_arrived_storage[compute_slot];
-                    uint64_t barrier_addr = __cvta_generic_to_shared(barrier_ptr);
+                    uint32_t barrier_addr = static_cast<uint32_t>(__cvta_generic_to_shared(barrier_ptr));
 
                     // Phase bit alternates 0,1,0,1... for each use of the barrier
                     uint32_t phase = (k_tile / PIPE_DEPTH) & 1;
@@ -307,10 +310,10 @@ __global__ __cluster_dims__(1, 1, 1) void my_matmul_kernel(
                         "{\n\t"
                         ".reg .pred p;\n\t"
                         "WAIT_LOOP:\n\t"
-                        "mbarrier.try_wait.parity.shared.b64 p, [%0], %1;\n\t"
+                        "mbarrier.try_wait.parity.shared::cta.b64 p, [%0], %1;\n\t"
                         "@!p bra WAIT_LOOP;\n\t"
                         "}"
-                        :: "l"(barrier_addr), "r"(phase) : "memory"
+                        :: "r"(barrier_addr), "r"(phase) : "memory"
                     );
                 }
                 __syncwarp();  // Ensure all threads in warp 0 know data is ready
@@ -424,10 +427,10 @@ __global__ __cluster_dims__(1, 1, 1) void my_matmul_kernel(
                 // Consumer tells producer that it's done with this slot (PTX arrive)
                 if (threadIdx.x == 0) {
                     uint64_t* barrier_ptr = &inputs_finished_storage[compute_slot];
-                    uint64_t barrier_addr = __cvta_generic_to_shared(barrier_ptr);
+                    uint32_t barrier_addr = static_cast<uint32_t>(__cvta_generic_to_shared(barrier_ptr));
                     asm volatile(
-                        "mbarrier.arrive.shared.b64 _, [%0];"
-                        :: "l"(barrier_addr) : "memory"
+                        "mbarrier.arrive.release.cta.shared::cta.b64 _, [%0];"
+                        :: "r"(barrier_addr) : "memory"
                     );
                 }
             }
@@ -437,7 +440,7 @@ __global__ __cluster_dims__(1, 1, 1) void my_matmul_kernel(
                 // Wait for consumer to finish with the slot we're about to reuse
                 if (k_tile >= PIPE_DEPTH) {
                     uint64_t* barrier_ptr = &inputs_finished_storage[load_slot];
-                    uint64_t barrier_addr = __cvta_generic_to_shared(barrier_ptr);
+                    uint32_t barrier_addr = static_cast<uint32_t>(__cvta_generic_to_shared(barrier_ptr));
 
                     // Phase bit for this barrier
                     // First wait on slot 0 happens at k_tile=4, phase should be 0
@@ -449,10 +452,10 @@ __global__ __cluster_dims__(1, 1, 1) void my_matmul_kernel(
                         "{\n\t"
                         ".reg .pred p;\n\t"
                         "WAIT_LOOP2:\n\t"
-                        "mbarrier.try_wait.parity.shared.b64 p, [%0], %1;\n\t"
+                        "mbarrier.try_wait.parity.shared::cta.b64 p, [%0], %1;\n\t"
                         "@!p bra WAIT_LOOP2;\n\t"
                         "}"
-                        :: "l"(barrier_addr), "r"(phase) : "memory"
+                        :: "r"(barrier_addr), "r"(phase) : "memory"
                     );
                 }
 
