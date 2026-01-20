@@ -214,9 +214,9 @@ __global__ void my_matmul_kernel(
 
     // tcgen05.alloc writes the allocated TMEM address to shared memory at [dst]
     // Per PTX docs: "When .cta_group::1 is specified, one warp from the CTA must perform the allocation"
-    // All 32 threads in warp 0 must execute this instruction (it's warp-collective)
+    // Use warp 1 (not warp 0) for allocation - matching example code pattern
     // The PTX examples show using ld.shared.b32 to read the result after alloc
-    if (threadIdx.x < 32) {
+    if (threadIdx.x >= 32 && threadIdx.x < 64) {  // warp 1
         const int addr = static_cast<int>(__cvta_generic_to_shared(tmem_base));
         asm volatile(
             "tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;"
@@ -535,9 +535,9 @@ __global__ void my_matmul_kernel(
     checkpoint(checkpoint_buffer, 6);  // CHECKPOINT 6: Before TMEM dealloc
 
     uint32_t dealloc_num_cols = TMEM_COLS;
-    // Only warp 0 (threads 0-31) executes tcgen05.dealloc
+    // Use warp 1 (threads 32-63) for dealloc - same warp that did alloc
     // Per PTX docs: "When .cta_group::1 is specified, one warp from the CTA must perform the allocation and de-allocation"
-    if (threadIdx.x < 32) {
+    if (threadIdx.x >= 32 && threadIdx.x < 64) {  // warp 1
         asm volatile(
             "tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, %1;"
             :
