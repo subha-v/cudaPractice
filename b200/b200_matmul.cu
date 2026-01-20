@@ -486,45 +486,44 @@ __global__ __cluster_dims__(1, 1, 1) void my_matmul_kernel(
         // Consumer warpgroup reads from TMEM and writes directly to global memory
         if (wg_id == 0) {
 
-            // tcgen05.ld is warp-collective: all 32 threads in a warp must use same taddr
-            // using shape .16x256b.x1: loads 512 bytes (1 TMEM column = 128 floats)
-            // each thread gets 4 registers (4 floats), 32 threads × 4 = 128 floats
-            // consumer warpgroup has 4 warps, each handles 64 columns (256/4)
+            // tcgen05.ld lane access restrictions:
+            // - Warp 0: can access lanes 0-31
+            // - Warp 1: can access lanes 32-63
+            // - Warp 2: can access lanes 64-95
+            // - Warp 3: can access lanes 96-127
+            // Each warp reads ALL columns, but only its 32 lanes from each column
 
-            int warp_in_consumer = threadIdx.x / 32;  // 0-3 within consumer warpgroup
-            int lane_id = threadIdx.x % 32;           // 0-31 within warp
-            int cols_per_warp = TMEM_COLS / 4;        // 64 columns per warp
+            int warp_in_warpgroup = threadIdx.x / 32;  // 0-3 within warpgroup
+            int lane_id = threadIdx.x % 32;            // 0-31 within warp
+            int lane_offset = warp_in_warpgroup * 32;  // Starting lane for this warp
 
-            for (int col_idx = 0; col_idx < cols_per_warp; col_idx++) {
-                int col = warp_in_consumer * cols_per_warp + col_idx;
+            // All warps iterate through all columns
+            for (int col = 0; col < TMEM_COLS; col++) {
+                // taddr encodes both column and lane offset
+                // TMEM layout: 128 lanes per column, taddr = col * 128 + lane_offset
+                uint32_t taddr = tmem_base[0] + col * 128 + lane_offset;
 
-                // all threads in warp use the SAME taddr (base of this column)
-                // taddr is the column number, not byte offset
-                uint32_t taddr = tmem_base[0] + col;
-
-                // Collective load: each thread receives 4 floats from the column
-                // .32x32b accesses all 32 lanes the warp owns, .x4 = 4 floats per thread
-                float r0, r1, r2, r3;
+                // Collective load: .32x32b.x1 = 32 lanes × 1 float = 1 float per thread
+                // Each thread in the warp reads 1 float from its lane
+                float r0;
                 asm volatile(
-                    "tcgen05.ld.sync.aligned.32x32b.x4.b32 {%0, %1, %2, %3}, [%4];"
-                    : "=f"(r0), "=f"(r1), "=f"(r2), "=f"(r3)
+                    "tcgen05.ld.sync.aligned.32x32b.x1.b32 %0, [%1];"
+                    : "=f"(r0)
                     : "r"(taddr)
                 );
 
                 // Wait for tcgen05.ld to complete before using data
                 asm volatile("tcgen05.wait::ld.sync.aligned;");
 
-                // Write directly to global memory (no SMEM staging)
-                // Assuming lane t gets rows [t*4, t*4+3] of this column
-                int base_row = lane_id * 4;
+                // Write to global memory
+                // This warp handles rows [lane_offset, lane_offset+31]
+                // Each thread handles 1 row (its lane within the warp's range)
+                int row_in_tile = lane_offset + lane_id;  // 0-127
+                int global_row = tile_row * TILE_M + row_in_tile;
                 int global_col = tile_col * TILE_N + col;
 
-                if (base_row + 3 < TILE_M) {
-                    int global_row_base = tile_row * TILE_M + base_row;
-                    C[(global_row_base + 0) * N + global_col] = __float2bfloat16(r0);
-                    C[(global_row_base + 1) * N + global_col] = __float2bfloat16(r1);
-                    C[(global_row_base + 2) * N + global_col] = __float2bfloat16(r2);
-                    C[(global_row_base + 3) * N + global_col] = __float2bfloat16(r3);
+                if (row_in_tile < TILE_M) {
+                    C[global_row * N + global_col] = __float2bfloat16(r0);
                 }
             }
         }
