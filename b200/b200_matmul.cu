@@ -268,8 +268,12 @@ __global__ __cluster_dims__(1, 1, 1) void my_matmul_kernel(
         // TMEM zeroing is handled by using scale_d=0 on first WGMMA iteration
 
         // 1 thread of the producer loads the first tiles
+        // Prefetch PIPE_DEPTH - 1 tiles, leaving one slot free for the main loop
+        // This matches the pattern from example_kernel.cu and prevents barrier violations:
+        // If we prefetch all PIPE_DEPTH slots, the first main loop iteration would
+        // try to arrive on a barrier that was already arrived on during prefetch.
         if (wg_id == 1 && threadIdx.x == 128) {  // First thread of producer warpgroup
-            int prefetch_count = min(PIPE_DEPTH, num_k_tiles); // min (4, tiles) = 4 usually
+            int prefetch_count = min(PIPE_DEPTH - 1, num_k_tiles); // Leave one slot free
             for (int k_tile = 0; k_tile < prefetch_count; k_tile++) {
                 int slot = k_tile % PIPE_DEPTH;
                 launch_tma_load( // loads in tiles A and B to SMEM
@@ -288,7 +292,9 @@ __global__ __cluster_dims__(1, 1, 1) void my_matmul_kernel(
         // note that each tile of A is 128 x 64 and each tile of B is 64 x 256, where K = 64 (we just set that lol)
         for (int k_tile = 0; k_tile < num_k_tiles; k_tile++) { // i think we have like 32 k tiles for 1024 x 1024
             int compute_slot = k_tile % PIPE_DEPTH; // which slot is the tile were computing on is in
-            int load_k_tile = k_tile + PIPE_DEPTH; // which one to load for the producer
+            // With PIPE_DEPTH-1 prefetch, we've loaded tiles 0..(PIPE_DEPTH-2)
+            // At k_tile=0, load tile (PIPE_DEPTH-1) which fills the last empty slot
+            int load_k_tile = k_tile + (PIPE_DEPTH - 1); // which one to load for the producer
             int load_slot = load_k_tile % PIPE_DEPTH; // which slot to load it into
 
             // Consumer warpgroup waits for data, but ONLY ONE THREAD issues tcgen05.mma
@@ -438,14 +444,22 @@ __global__ __cluster_dims__(1, 1, 1) void my_matmul_kernel(
             // Producer loads the next tile (runs in parallel with consumer's WGMMA!)
             if (wg_id == 1 && threadIdx.x == 128 && load_k_tile < num_k_tiles) {
                 // Wait for consumer to finish with the slot we're about to reuse
-                if (k_tile >= PIPE_DEPTH) {
+                // With PIPE_DEPTH-1 prefetch: slots 0..(PIPE_DEPTH-2) were used by prefetch,
+                // slot (PIPE_DEPTH-1) is empty. So first load (k_tile=0) goes to empty slot,
+                // but k_tile>=1 needs to wait for consumer to finish.
+                // Condition: load_k_tile >= PIPE_DEPTH means we're reusing a previously-loaded slot
+                if (load_k_tile >= PIPE_DEPTH) {
                     uint64_t* barrier_ptr = &inputs_finished_storage[load_slot];
                     uint32_t barrier_addr = static_cast<uint32_t>(__cvta_generic_to_shared(barrier_ptr));
 
                     // Phase bit for this barrier
-                    // First wait on slot 0 happens at k_tile=4, phase should be 0
-                    // Second wait on slot 0 happens at k_tile=8, phase should be 1
-                    uint32_t phase = ((k_tile - PIPE_DEPTH) / PIPE_DEPTH) & 1;
+                    // With PIPE_DEPTH-1 prefetch:
+                    // - First wait on slot 0 happens at k_tile=1 (load_k_tile=4), phase should be 0
+                    // - Second wait on slot 0 happens at k_tile=5 (load_k_tile=8), phase should be 1
+                    // The consumer signals finished[slot] at k_tile = slot, slot+PIPE_DEPTH, ...
+                    // We wait at k_tile = slot+1, slot+1+PIPE_DEPTH, ...
+                    // Phase = ((k_tile - 1) / PIPE_DEPTH) & 1
+                    uint32_t phase = ((k_tile - 1) / PIPE_DEPTH) & 1;
 
                     // Producer only waits - consumer signals via arrive
                     asm volatile(
