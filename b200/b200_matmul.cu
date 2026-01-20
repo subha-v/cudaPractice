@@ -73,6 +73,7 @@ constexpr int NUM_THREADS = NUM_WORKERS * 32;  // 32 threads per warp = 256 thre
 constexpr int TMEM_COLS = 256;  // 128x256 tile * 4 bytes = 131072 bytes = 256 columns
 
 // helper function to make tma load from gmem to smem
+// Uses 3D tensor map with coordinates {0, row_offset, k_tile}
 __device__ __forceinline__ void launch_tma_load(
     int slot,
     int k_tile,
@@ -90,7 +91,6 @@ __device__ __forceinline__ void launch_tma_load(
     uint32_t expected_bytes = bytes_A + bytes_B;
 
     // Signal barrier with expected transaction bytes using PTX
-    // Use .release.cta.shared::cta qualifiers for proper memory ordering
     uint32_t barrier_addr = static_cast<uint32_t>(__cvta_generic_to_shared(barrier));
     asm volatile(
         "mbarrier.arrive.expect_tx.release.cta.shared::cta.b64 _, [%0], %1;"
@@ -99,37 +99,43 @@ __device__ __forceinline__ void launch_tma_load(
         : "memory"
     );
 
-    // TMA expects ELEMENT coordinates, not tile indices!
-    // Convert tile indices to element coordinates
-    int a_coord_k = k_tile * TILE_K;      // K dimension element coordinate
-    int a_coord_m = tile_row * TILE_M;    // M dimension element coordinate
-    int b_coord_k = k_tile * TILE_K;      // K dimension element coordinate
-    int b_coord_n = tile_col * TILE_N;    // N dimension element coordinate
+    // 3D TMA coordinates: {coord0, coord1, coord2}
+    // Tensor map layout: (64, HEIGHT, K/64)
+    // - coord0 = 0: always start at element 0 within the 64-element block
+    // - coord1 = row offset (tile_row * TILE_M for A, tile_col * TILE_N for B)
+    // - coord2 = k_tile: which K/64 block (since TILE_K=64, this equals k_tile)
+    int a_coord_0 = 0;                        // Always 0 (start of 64-element block)
+    int a_coord_1 = tile_row * TILE_M;        // M dimension offset
+    int a_coord_2 = k_tile;                   // K/64 block index (TILE_K=64, so k_tile directly)
 
-    // Launch TMA for A - explicitly specify .tile mode for sm_100a compatibility
-    // A tensor map: globalDim={K, M}, so coords are {k_coord, m_coord}
+    int b_coord_0 = 0;                        // Always 0
+    int b_coord_1 = tile_col * TILE_N;        // N dimension offset
+    int b_coord_2 = k_tile;                   // K/64 block index
+
+    // Launch TMA for A - 3D tensor with 128B swizzle
     asm volatile(
-        "cp.async.bulk.tensor.2d.shared::cta.global.tile.mbarrier::complete_tx::bytes"
-        " [%0], [%1, {%2, %3}], [%4];"
+        "cp.async.bulk.tensor.3d.shared::cta.global.tile.mbarrier::complete_tx::bytes"
+        " [%0], [%1, {%2, %3, %4}], [%5];"
         :
         : "r"((uint32_t)__cvta_generic_to_shared(a_smem[slot])),
           "l"(tensor_map_A),
-          "r"(a_coord_k),     // coordinate 0: K dimension (element coord)
-          "r"(a_coord_m),     // coordinate 1: M dimension (element coord)
+          "r"(a_coord_0),     // coordinate 0: always 0
+          "r"(a_coord_1),     // coordinate 1: M offset
+          "r"(a_coord_2),     // coordinate 2: K/64 block
           "r"((uint32_t)barrier_addr)
         : "memory"
     );
 
-    // Launch TMA for B - explicitly specify .tile mode for sm_100a compatibility
-    // B tensor map: globalDim={K, N}, so coords are {k_coord, n_coord}
+    // Launch TMA for B - 3D tensor with 128B swizzle
     asm volatile(
-        "cp.async.bulk.tensor.2d.shared::cta.global.tile.mbarrier::complete_tx::bytes"
-        " [%0], [%1, {%2, %3}], [%4];"
+        "cp.async.bulk.tensor.3d.shared::cta.global.tile.mbarrier::complete_tx::bytes"
+        " [%0], [%1, {%2, %3, %4}], [%5];"
         :
         : "r"((uint32_t)__cvta_generic_to_shared(b_smem[slot])),
           "l"(tensor_map_B),
-          "r"(b_coord_k),     // coordinate 0: K dimension (element coord)
-          "r"(b_coord_n),     // coordinate 1: N dimension (element coord)
+          "r"(b_coord_0),     // coordinate 0: always 0
+          "r"(b_coord_1),     // coordinate 1: N offset
+          "r"(b_coord_2),     // coordinate 2: K/64 block
           "r"((uint32_t)barrier_addr)
         : "memory"
     );
@@ -345,61 +351,49 @@ __global__ __cluster_dims__(1, 1, 1) void my_matmul_kernel(
                     idesc |= (32 << 17);  // bits 17-22: N >> 3 = 256 >> 3 = 32
                     idesc |= (8 << 24);   // bits 24-28: M >> 4 = 128 >> 4 = 8
 
+                    // SMEM descriptor format (from PTX docs 9.7.16.4.1):
+                    // Bits 0-13:   matrix-descriptor-encode(start address)
+                    // Bits 16-29:  matrix-descriptor-encode(LBO) - not used with 128B swizzle
+                    // Bits 32-45:  matrix-descriptor-encode(SBO) - stride byte offset
+                    // Bits 46-48:  Fixed constant 0b001
+                    // Bits 49-51:  Matrix base offset (0 for 1024-byte aligned)
+                    // Bit 52:      Leading dimension stride mode (0 = relative)
+                    // Bits 53-60:  Fixed constant 0x00
+                    // Bits 61-63:  Swizzle mode (2 = 128-byte swizzle)
+                    //
+                    // matrix-descriptor-encode(x) = (x & 0x3FFFF) >> 4
+
+                    // Helper lambda for descriptor encoding
+                    auto desc_encode = [](uint32_t x) -> uint64_t {
+                        return (x & 0x3FFFF) >> 4;
+                    };
+
+                    // SBO = 8 * 128 = 1024 bytes (stride for 128B swizzle pattern)
+                    // This is the stride to the next swizzle block
+                    constexpr uint32_t SBO = 8 * 128;  // 1024 bytes
+
+                    // Make SMEM descriptor with 128B swizzle (mode 2)
+                    auto make_desc = [&](uint32_t addr) -> uint64_t {
+                        return desc_encode(addr)              // bits 0-13: encoded address
+                             | (desc_encode(SBO) << 32)       // bits 32-45: encoded SBO
+                             | (1ULL << 46)                   // bits 46-48: fixed 0b001
+                             | (2ULL << 61);                  // bits 61-63: 128B swizzle
+                    };
+
                     // tcgen05.mma for 128x256 output tile with K=64
-                    // Each tcgen05.mma handles 128 rows, 256 cols, 16 k-elements
-                    // Need 4 k-steps (TILE_K=64, step=16)
-
-                    // SMEM descriptor format (64-bit):
-                    // bits 0-13:  base address >> 4
-                    // bits 16-29: LBO (leading byte offset) - stride in K dimension
-                    // bits 32-45: SBO (stride byte offset) - stride in M/N dimension
-                    // bits 61-63: swizzle mode (0 = none)
-
-                    // For A (128 x 64 bf16, row-major):
-                    //   - LBO = stride to next K element = 2 bytes (adjacent in memory)
-                    //   - SBO = stride to next M row = TILE_K * 2 = 128 bytes
-                    // For B (64 x 256 bf16, stored column-major as 256 x 64):
-                    //   - LBO = stride to next K element = 2 bytes (adjacent)
-                    //   - SBO = stride to next N column = TILE_K * 2 = 128 bytes
+                    // Each tcgen05.mma handles M=128, N=256, K=16
+                    // With TILE_K=64, we need 64/16 = 4 k-steps
+                    // Each k-step advances by 32 bytes (16 bf16 elements * 2 bytes)
+                    constexpr int MMA_K = 16;
 
                     #pragma unroll
-                    for (int k_step = 0; k_step < TILE_K; k_step += 16) {
-                        // A offset: k_step columns into the 128x64 A tile
-                        // B offset: k_step rows into the 64x256 B tile
-                        uint32_t a_offset = k_step * sizeof(__nv_bfloat16);
-                        uint32_t b_offset = k_step * sizeof(__nv_bfloat16);  // B is K-major
-
-                        uint32_t a_smem_addr = a_addr + a_offset;
-                        uint32_t b_smem_addr = b_addr + b_offset;
-
-                        // A descriptor: 128 rows x K bf16
-                        // LBO = 16 bytes (8 bf16 elements, core matrix width)
-                        // SBO = TILE_K * 2 = 128 bytes (stride to next row of 8 rows)
-                        uint64_t a_lbo = 16;   // Core matrix is 8 elements wide = 16 bytes
-                        uint64_t a_sbo = TILE_K * sizeof(__nv_bfloat16);  // 128 bytes
-
-                        uint64_t a_desc = ((uint64_t)(a_smem_addr) & 0x3FFFF) |
-                                          ((a_lbo & 0x3FFF) << 16) |
-                                          ((a_sbo & 0x3FFF) << 32);
-
-                        // B descriptor: K x 256 bf16 (K-major)
-                        // LBO = 16 bytes (core matrix width)
-                        // SBO = TILE_K * 2 = 128 bytes (stride to next column group)
-                        uint64_t b_lbo = 16;
-                        uint64_t b_sbo = TILE_K * sizeof(__nv_bfloat16);  // 128 bytes
-
-                        uint64_t b_desc = ((uint64_t)(b_smem_addr) & 0x3FFFF) |
-                                          ((b_lbo & 0x3FFF) << 16) |
-                                          ((b_sbo & 0x3FFF) << 32);
-
-                        // tcgen05.mma format (from PTX docs):
-                        // tcgen05.mma.cta_group::1.kind::f16 [d-tmem], a-desc, b-desc, idesc,
-                        //                                    {disable-output-lane x4}, enable-input-d;
-                        // - disable-output-lane: 4 x 32-bit masks (0 = don't disable)
-                        // - enable-input-d: predicate (0 = D=A*B, 1 = D=A*B+D)
+                    for (int k2 = 0; k2 < TILE_K / MMA_K; k2++) {
+                        // Each k2 iteration processes 16 K elements (32 bytes)
+                        uint64_t a_desc = make_desc(a_addr + k2 * 32);
+                        uint64_t b_desc = make_desc(b_addr + k2 * 32);
 
                         // First iteration zeros accumulator, the rest accumulate
-                        if (k_tile == 0 && k_step == 0) {
+                        if (k_tile == 0 && k2 == 0) {
                             // D = A*B (enable_d = false, no accumulation)
                             asm volatile(
                                 "{\n\t"
@@ -558,53 +552,63 @@ __global__ __cluster_dims__(1, 1, 1) void my_matmul_kernel(
 }
 
 
-// create TMA tensor map
-CUtensorMap create_tensor_map(
+// create TMA tensor map - 3D with 128B swizzle for tcgen05.mma
+// Layout: (64, HEIGHT, K/64) with strides (K*sizeof, 128)
+// This creates the swizzled layout expected by tcgen05.mma
+CUtensorMap create_tensor_map_3d(
     void* global_ptr,           // Pointer to matrix in global memory
-    int rows,                   // Number of rows in full matrix
-    int cols,                   // Number of columns in full matrix
-    int tile_rows,              // Tile height
-    int tile_cols               // Tile width
+    int height,                 // Number of rows (M for A, N for B)
+    int K,                      // K dimension size
+    int tile_height,            // Tile height (TILE_M for A, TILE_N for B)
+    int tile_k                  // Tile K dimension (TILE_K)
 ) {
     CUtensorMap tensor_map;
 
-    // Dimensions of the full matrix (in elements)
-    cuuint64_t globalDim[2] = {(cuuint64_t)cols, (cuuint64_t)rows};
+    // 3D tensor map: (64, height, K/64)
+    // - Dimension 0: 64 elements (128 bytes for bf16) - the swizzle unit
+    // - Dimension 1: height (M or N rows)
+    // - Dimension 2: K/64 (number of 64-element K chunks)
+    constexpr uint32_t rank = 3;
+    cuuint64_t globalDim[rank] = {64, (cuuint64_t)height, (cuuint64_t)K / 64};
 
-    // strides
-    cuuint64_t globalStrides[1] = {
-        (cuuint64_t)cols * sizeof(__nv_bfloat16)  // Stride to next row in bytes
+    // Strides in bytes:
+    // - stride[0]: bytes to next row = K * sizeof(bf16)
+    // - stride[1]: bytes to next K/64 block = 128 bytes (64 elements * 2)
+    cuuint64_t globalStrides[rank-1] = {
+        (cuuint64_t)K * sizeof(__nv_bfloat16),  // stride to next row
+        128                                      // stride between 64-element K blocks
     };
-    cuuint32_t boxDim[2] = {(cuuint32_t)tile_cols, (cuuint32_t)tile_rows};
-    cuuint32_t elementStrides[2] = {1, 1};
 
-    //debug
-    std::cout << "TMA params: globalDim={" << globalDim[0] << "," << globalDim[1] << "}"
-              << " boxDim={" << boxDim[0] << "," << boxDim[1] << "}"
-              << " stride=" << globalStrides[0]
-              << " boxDim[0]*sizeof=" << (boxDim[0] * sizeof(__nv_bfloat16)) << " bytes" << std::endl;
+    // Box dimensions for the tile
+    cuuint32_t boxDim[rank] = {
+        64,                                      // always 64 (the swizzle unit)
+        (cuuint32_t)tile_height,                 // TILE_M or TILE_N
+        (cuuint32_t)tile_k / 64                  // TILE_K / 64
+    };
+    cuuint32_t elementStrides[rank] = {1, 1, 1};
 
+    std::cout << "TMA 3D params: globalDim={" << globalDim[0] << "," << globalDim[1] << "," << globalDim[2] << "}"
+              << " boxDim={" << boxDim[0] << "," << boxDim[1] << "," << boxDim[2] << "}"
+              << " strides={" << globalStrides[0] << "," << globalStrides[1] << "}"
+              << " (128B swizzle)" << std::endl;
 
     CUresult result = cuTensorMapEncodeTiled(
         &tensor_map,
-        CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,      
-        2,                                      
-        global_ptr,                          
-        globalDim,                             
-        globalStrides,                         
-        boxDim,                                 
-        elementStrides,                        
-        CU_TENSOR_MAP_INTERLEAVE_NONE,         
-        CU_TENSOR_MAP_SWIZZLE_NONE,           
-        CU_TENSOR_MAP_L2_PROMOTION_NONE,       
-        CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE     
+        CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
+        rank,                                   // 3D tensor
+        global_ptr,
+        globalDim,
+        globalStrides,
+        boxDim,
+        elementStrides,
+        CU_TENSOR_MAP_INTERLEAVE_NONE,
+        CU_TENSOR_MAP_SWIZZLE_128B,            // 128-byte swizzling!
+        CU_TENSOR_MAP_L2_PROMOTION_NONE,
+        CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE
     );
 
     if (result != CUDA_SUCCESS) {
         std::cerr << "cuTensorMapEncodeTiled FAILED with error: " << result << std::endl;
-        std::cerr << "  Possible issue: boxDim[0]*sizeof(element) = "
-                  << (boxDim[0] * sizeof(__nv_bfloat16))
-                  << " bytes (max 128 bytes for SWIZZLE_NONE)" << std::endl;
     }
 
     return tensor_map;
@@ -729,11 +733,11 @@ int run_benchmark(size_t M, size_t N, size_t K) {
 
     std::cout << "Copied matrices to device (B in column-major)" << std::endl;
 
-    // Create TMA descriptors
-    // A: M x K row-major, inner dim = K, boxDim[0] = TILE_K = 64
-    CUtensorMap tensor_map_A = create_tensor_map(d_A, M, K, TILE_M, TILE_K);
-    // B: now N x K column-major (K contiguous), inner dim = K, boxDim[0] = TILE_K = 64
-    CUtensorMap tensor_map_B = create_tensor_map(d_B, N, K, TILE_N, TILE_K);
+    // Create TMA descriptors - 3D with 128B swizzle
+    // A: M x K row-major, loaded as 3D (64, M, K/64)
+    CUtensorMap tensor_map_A = create_tensor_map_3d(d_A, M, K, TILE_M, TILE_K);
+    // B: N x K (transposed), loaded as 3D (64, N, K/64)
+    CUtensorMap tensor_map_B = create_tensor_map_3d(d_B, N, K, TILE_N, TILE_K);
 
     std::cout << "Created TMA descriptors" << std::endl;
     std::cout << "Launching kernel with grid(" << grid.x << "), block(" << block.x << ")" << std::endl;
