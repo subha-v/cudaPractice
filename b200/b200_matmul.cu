@@ -459,46 +459,86 @@ __global__ __cluster_dims__(1, 1, 1) void my_matmul_kernel(
         // Now sync all threads - after this, all threads know MMA is complete
         __syncthreads();
 
-        // store results from TMEM to global memory
-        // Layout D (M=128 + cta_group::1): address = taddr + ((warp_id * 32) << 16) + col_offset
-        // Reference: example_kernel.cu and PTX docs section 9.7.16.10.5.4
-        if (wg_id == 0) {
-            int warp_id = threadIdx.x / 32;  // 0-3 within warpgroup
-            int lane_id = threadIdx.x % 32;  // 0-31 within warp
+        // =====================================================================
+        // EPILOGUE: TMEM → SMEM transpose → Global Memory (COALESCED)
+        // =====================================================================
+        // Problem: tcgen05.ld returns data organized by rows (each thread owns one row).
+        // Writing row-major matrix C with this mapping causes strided accesses:
+        //   Thread 0 → row 0, Thread 1 → row 1, etc. (N elements apart = terrible!)
+        //
+        // Solution: Transpose via SMEM so threads write consecutive columns of SAME row.
+        // After transpose: each warp writes one row, 32 lanes write 8 consecutive cols each.
+        //
+        // Reuse a_smem as float buffer (64KB available, need 128×256×4 = 128KB)
+        // Process in 2 halves: columns 0-127, then 128-255
 
-            // Load 8 columns at a time using .32x32b.x8 shape
-            // Each thread gets 8 floats (one from each of 8 columns)
-            for (int n = 0; n < TMEM_COLS / 8; n++) {
-                // Layout D address encoding: lane_offset in upper bits, column in lower bits
-                uint32_t addr = tmem_base[0] + ((warp_id * 32) << 16) + (n * 8);
+        float* output_smem = reinterpret_cast<float*>(a_smem[0]);  // 64KB = 16K floats = 128×128
 
-                float tmp[8];
-                asm volatile(
-                    "tcgen05.ld.sync.aligned.32x32b.x8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
-                    : "=f"(tmp[0]), "=f"(tmp[1]), "=f"(tmp[2]), "=f"(tmp[3]),
-                      "=f"(tmp[4]), "=f"(tmp[5]), "=f"(tmp[6]), "=f"(tmp[7])
-                    : "r"(addr)
-                );
-                asm volatile("tcgen05.wait::ld.sync.aligned;");
+        // Process columns in two halves (128 cols each)
+        for (int col_half = 0; col_half < 2; col_half++) {
+            int col_base = col_half * 128;  // 0 or 128
 
-                // Convert f32 to bf16 pairs and write as int4 (16 bytes) for coalescing
-                // Each warp handles 32 rows (warp_id*32 to warp_id*32+31)
-                // Each thread handles 1 row (lane_id within the warp's range)
-                int row_in_tile = warp_id * 32 + lane_id;
-                int global_row = tile_row * TILE_M + row_in_tile;
-                int global_col = tile_col * TILE_N + n * 8;
+            // Step 1: Load 128 TMEM columns to SMEM (all 128 threads participate)
+            // Each warp loads its 32 rows for 128 columns (16 chunks of 8)
+            if (wg_id == 0) {
+                int warp_id = threadIdx.x / 32;
+                int lane_id = threadIdx.x % 32;
 
-                // Convert 8 floats to 4 bf16x2 pairs and store as int4
-                __nv_bfloat162 out[4];
-                out[0] = __floats2bfloat162_rn(tmp[0], tmp[1]);
-                out[1] = __floats2bfloat162_rn(tmp[2], tmp[3]);
-                out[2] = __floats2bfloat162_rn(tmp[4], tmp[5]);
-                out[3] = __floats2bfloat162_rn(tmp[6], tmp[7]);
+                for (int chunk = 0; chunk < 16; chunk++) {
+                    int n = col_base / 8 + chunk;  // TMEM column chunk index
+                    uint32_t addr = tmem_base[0] + ((warp_id * 32) << 16) + (n * 8);
 
-                // Store 16 bytes (8 bf16 values) at once
-                __nv_bfloat16* out_ptr = C + global_row * N + global_col;
-                reinterpret_cast<int4*>(out_ptr)[0] = reinterpret_cast<int4*>(out)[0];
+                    float tmp[8];
+                    asm volatile(
+                        "tcgen05.ld.sync.aligned.32x32b.x8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
+                        : "=f"(tmp[0]), "=f"(tmp[1]), "=f"(tmp[2]), "=f"(tmp[3]),
+                          "=f"(tmp[4]), "=f"(tmp[5]), "=f"(tmp[6]), "=f"(tmp[7])
+                        : "r"(addr)
+                    );
+                    asm volatile("tcgen05.wait::ld.sync.aligned;");
+
+                    // Store to SMEM: [row][col] layout, 128 cols stride
+                    int my_row = warp_id * 32 + lane_id;
+                    #pragma unroll
+                    for (int c = 0; c < 8; c++) {
+                        output_smem[my_row * 128 + chunk * 8 + c] = tmp[c];
+                    }
+                }
             }
+            __syncthreads();
+
+            // Step 2: Write from SMEM to global with COALESCED access pattern
+            // New mapping: each warp writes ONE row, 32 lanes write consecutive 8-col chunks
+            // This gives perfect coalescing: 32 threads × 16 bytes = 512 bytes consecutive
+            if (wg_id == 0) {
+                int warp_id = threadIdx.x / 32;
+                int lane_id = threadIdx.x % 32;
+
+                // 4 warps write 4 rows per iteration, 32 iterations for 128 rows
+                for (int r = 0; r < TILE_M; r += 4) {
+                    int row = r + warp_id;  // Which row this warp handles
+                    int col_start = lane_id * 4;  // Each lane writes 4 cols (8 bytes)
+                    // Note: 128 cols / 32 lanes = 4 cols per lane
+
+                    // Load 4 floats from SMEM
+                    float vals[4];
+                    #pragma unroll
+                    for (int c = 0; c < 4; c++) {
+                        vals[c] = output_smem[row * 128 + col_start + c];
+                    }
+
+                    // Convert to bf16 pairs and write as int2 (8 bytes)
+                    __nv_bfloat162 bvals[2];
+                    bvals[0] = __floats2bfloat162_rn(vals[0], vals[1]);
+                    bvals[1] = __floats2bfloat162_rn(vals[2], vals[3]);
+
+                    int global_row = tile_row * TILE_M + row;
+                    int global_col = tile_col * TILE_N + col_base + col_start;
+                    __nv_bfloat16* out_ptr = C + global_row * N + global_col;
+                    reinterpret_cast<int2*>(out_ptr)[0] = reinterpret_cast<int2*>(bvals)[0];
+                }
+            }
+            __syncthreads();
         }
 
         // Sync before next output tile
