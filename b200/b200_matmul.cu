@@ -223,6 +223,7 @@ __global__ __cluster_dims__(1, 1, 1) void my_matmul_kernel(
     }
     __syncthreads();
     // hi
+    // wow
 
     // tcgen05.alloc writes the allocated TMEM address to shared memory at [dst]
     // Per PTX docs: "When .cta_group::1 is specified, one warp from the CTA must perform the allocation"
