@@ -503,9 +503,10 @@ __global__ __cluster_dims__(1, 1, 1) void my_matmul_kernel(
                 uint32_t taddr = tmem_base[0] + col;
 
                 // Collective load: each thread receives 4 floats from the column
+                // .32x32b accesses all 32 lanes the warp owns, .x4 = 4 floats per thread
                 float r0, r1, r2, r3;
                 asm volatile(
-                    "tcgen05.ld.sync.aligned.16x256b.x1.b32 {%0, %1, %2, %3}, [%4];"
+                    "tcgen05.ld.sync.aligned.32x32b.x4.b32 {%0, %1, %2, %3}, [%4];"
                     : "=f"(r0), "=f"(r1), "=f"(r2), "=f"(r3)
                     : "r"(taddr)
                 );
