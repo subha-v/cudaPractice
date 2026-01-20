@@ -70,7 +70,7 @@ constexpr int NUM_THREADS = NUM_WORKERS * 32;  // 32 threads per warp = 256 thre
 
 
 // Organized in 512-byte columns: 128 * 256 * 4 bytes = 131072 bytes = 256 columns
-constexpr int TMEM_COLS = 8; // TESTING SMALLER ALLOCATION
+constexpr int TMEM_COLS = 256;  // 128x256 tile * 4 bytes = 131072 bytes = 256 columns
 
 // helper function to make tma load from gmem to smem
 __device__ __forceinline__ void launch_tma_load(
@@ -235,11 +235,9 @@ __global__ __cluster_dims__(1, 1, 1) void my_matmul_kernel(
     checkpoint(checkpoint_buffer, 3);  // CHECKPOINT 3: After TMEM alloc
 
     // DEBUG: Print tmem_base value to see if allocation succeeded
+    // Note: tmem_base = 0 is VALID - tensor memory starts at address 0
     if (threadIdx.x == 0) {
         printf("DEBUG: tmem_base = %u (0x%x)\n", tmem_base[0], tmem_base[0]);
-        if (tmem_base[0] == 0) {
-            printf("WARNING: tmem_base is 0 - allocation may have failed!\n");
-        }
         if (tmem_base[0] == 0xFFFFFFFF) {
             printf("ERROR: tmem_base is 0xFFFFFFFF - allocation explicitly failed!\n");
         }
