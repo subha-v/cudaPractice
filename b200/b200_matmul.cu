@@ -657,10 +657,10 @@ int run_benchmark(size_t M, size_t N, size_t K) {
     std::cout << "Tile sizes: TILE_M=" << TILE_M << ", TILE_N=" << TILE_N << ", TILE_K=" << TILE_K << std::endl;
 
     // Launch configuration
-    // DEBUG: Start with 1 block to verify tcgen05 instructions work
-    // Then increase gradually: 1 -> 4 -> 16 -> 148
-    const int NUM_BLOCKS = 1;
-    dim3 grid(NUM_BLOCKS, 1);       // Reduced for debugging
+    // B200 has 148 SMs - use all of them for peak performance
+    int num_tiles = (M / TILE_M) * (N / TILE_N);
+    int NUM_BLOCKS = min(num_tiles, 148);  // Use up to 148 blocks (one per SM)
+    dim3 grid(NUM_BLOCKS, 1);
     dim3 block(NUM_THREADS);        // 256 threads per block (2 warpgroups)
 
     // Checkpoint names for debugging
@@ -834,12 +834,11 @@ int run_benchmark(size_t M, size_t N, size_t K) {
 }
 
 int main() {
-    // Run single benchmark for debugging
-    // Uncomment additional sizes once the kernel works correctly
+    // Run benchmarks with increasing sizes
     run_benchmark(1024, 1024, 1024);
-    // run_benchmark(2048, 2048, 2048);
-    // run_benchmark(4096, 4096, 4096);
-    // run_benchmark(8192, 8192, 8192);
+    run_benchmark(2048, 2048, 2048);
+    run_benchmark(4096, 4096, 4096);
+    run_benchmark(8192, 8192, 8192);
 
     return 0;
 }
