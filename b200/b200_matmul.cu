@@ -483,47 +483,38 @@ __global__ __cluster_dims__(1, 1, 1) void my_matmul_kernel(
         __syncthreads();
 
         // store results from TMEM to global memory
-        // Consumer warpgroup reads from TMEM and writes directly to global memory
+        // Layout D (M=128 + cta_group::1): address = taddr + ((warp_id * 32) << 16) + col_offset
+        // Reference: example_kernel.cu and PTX docs section 9.7.16.10.5.4
         if (wg_id == 0) {
+            int warp_id = threadIdx.x / 32;  // 0-3 within warpgroup
+            int lane_id = threadIdx.x % 32;  // 0-31 within warp
 
-            // tcgen05.ld lane access restrictions:
-            // - Warp 0: can access lanes 0-31
-            // - Warp 1: can access lanes 32-63
-            // - Warp 2: can access lanes 64-95
-            // - Warp 3: can access lanes 96-127
-            // Each warp reads ALL columns, but only its 32 lanes from each column
+            // Load 8 columns at a time using .32x32b.x8 shape
+            // Each thread gets 8 floats (one from each of 8 columns)
+            for (int n = 0; n < TMEM_COLS / 8; n++) {
+                // Layout D address encoding: lane_offset in upper bits, column in lower bits
+                uint32_t addr = tmem_base[0] + ((warp_id * 32) << 16) + (n * 8);
 
-            int warp_in_warpgroup = threadIdx.x / 32;  // 0-3 within warpgroup
-            int lane_id = threadIdx.x % 32;            // 0-31 within warp
-            int lane_offset = warp_in_warpgroup * 32;  // Starting lane for this warp
-
-            // All warps iterate through all columns
-            for (int col = 0; col < TMEM_COLS; col++) {
-                // taddr encodes both column and lane offset
-                // TMEM layout: 128 lanes per column, taddr = col * 128 + lane_offset
-                uint32_t taddr = tmem_base[0] + col * 128 + lane_offset;
-
-                // Collective load: .32x32b.x1 = 32 lanes × 1 float = 1 float per thread
-                // Each thread in the warp reads 1 float from its lane
-                float r0;
+                float tmp[8];
                 asm volatile(
-                    "tcgen05.ld.sync.aligned.32x32b.x1.b32 %0, [%1];"
-                    : "=f"(r0)
-                    : "r"(taddr)
+                    "tcgen05.ld.sync.aligned.32x32b.x8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
+                    : "=f"(tmp[0]), "=f"(tmp[1]), "=f"(tmp[2]), "=f"(tmp[3]),
+                      "=f"(tmp[4]), "=f"(tmp[5]), "=f"(tmp[6]), "=f"(tmp[7])
+                    : "r"(addr)
                 );
-
-                // Wait for tcgen05.ld to complete before using data
                 asm volatile("tcgen05.wait::ld.sync.aligned;");
 
                 // Write to global memory
-                // This warp handles rows [lane_offset, lane_offset+31]
-                // Each thread handles 1 row (its lane within the warp's range)
-                int row_in_tile = lane_offset + lane_id;  // 0-127
+                // Each warp handles 32 rows (warp_id*32 to warp_id*32+31)
+                // Each thread handles 1 row (lane_id within the warp's range)
+                int row_in_tile = warp_id * 32 + lane_id;
                 int global_row = tile_row * TILE_M + row_in_tile;
-                int global_col = tile_col * TILE_N + col;
 
-                if (row_in_tile < TILE_M) {
-                    C[global_row * N + global_col] = __float2bfloat16(r0);
+                // Write 8 columns per iteration
+                for (int i = 0; i < 8; i++) {
+                    int col = n * 8 + i;
+                    int global_col = tile_col * TILE_N + col;
+                    C[global_row * N + global_col] = __float2bfloat16(tmp[i]);
                 }
             }
         }
