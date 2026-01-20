@@ -208,22 +208,8 @@ __global__ __cluster_dims__(1, 1, 1) void my_matmul_kernel(
 
     uint32_t num_cols = TMEM_COLS;
 
-    // DEBUG: Print shared memory address before alloc
-    if (threadIdx.x == 0) {
-        uint32_t smem_addr_debug = __cvta_generic_to_shared(tmem_base);
-        printf("DEBUG: smem_addr for tmem_base = %u (0x%x)\n", smem_addr_debug, smem_addr_debug);
-        printf("DEBUG: num_cols = %u\n", num_cols);
-
-        // Test: manually write to tmem_base to verify shared memory works
-        tmem_base[0] = 0xDEADBEEF;
-        printf("DEBUG: After manual write, tmem_base = 0x%x\n", tmem_base[0]);
-
-        // Reset for actual alloc
-        tmem_base[0] = 0;
-    }
-    __syncthreads();
-    // hi
-    // wow
+    // DEBUG printfs removed for performance - they serialize GPU execution
+    // tmem_base = 0 is valid (start of tensor memory address space)
 
     // tcgen05.alloc writes the allocated TMEM address to shared memory at [dst]
     // Per PTX docs: "When .cta_group::1 is specified, one warp from the CTA must perform the allocation"
@@ -231,31 +217,15 @@ __global__ __cluster_dims__(1, 1, 1) void my_matmul_kernel(
     // The PTX examples show using ld.shared.b32 to read the result after alloc
     if (threadIdx.x >= 32 && threadIdx.x < 64) {  // warp 1
         const int addr = static_cast<int>(__cvta_generic_to_shared(tmem_base));
-        if (threadIdx.x == 32) {
-            printf("DEBUG: Warp 1 executing tcgen05.alloc with addr=0x%x, num_cols=%u\n", addr, num_cols);
-        }
         asm volatile(
             "tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;"
             :: "r"(addr), "r"(num_cols)
             : "memory"
         );
-        if (threadIdx.x == 32) {
-            printf("DEBUG: Warp 1 completed tcgen05.alloc, tmem_base[0]=%u (0x%x)\n", tmem_base[0], tmem_base[0]);
-        }
     }
     __syncthreads();  // Ensure all threads see the allocated tmem_base
 
     checkpoint(checkpoint_buffer, 3);  // CHECKPOINT 3: After TMEM alloc
-
-    // DEBUG: Print tmem_base value to see if allocation succeeded
-    // Note: tmem_base = 0 is VALID - tensor memory starts at address 0
-    if (threadIdx.x == 0) {
-        printf("DEBUG: tmem_base = %u (0x%x)\n", tmem_base[0], tmem_base[0]);
-        if (tmem_base[0] == 0xFFFFFFFF) {
-            printf("ERROR: tmem_base is 0xFFFFFFFF - allocation explicitly failed!\n");
-        }
-    }
-    __syncthreads();  // Sync after debug print
 
     int num_tiles_m = M / TILE_M;
     int num_tiles_n = N / TILE_N;
@@ -511,18 +481,23 @@ __global__ __cluster_dims__(1, 1, 1) void my_matmul_kernel(
                 );
                 asm volatile("tcgen05.wait::ld.sync.aligned;");
 
-                // Write to global memory
+                // Convert f32 to bf16 pairs and write as int4 (16 bytes) for coalescing
                 // Each warp handles 32 rows (warp_id*32 to warp_id*32+31)
                 // Each thread handles 1 row (lane_id within the warp's range)
                 int row_in_tile = warp_id * 32 + lane_id;
                 int global_row = tile_row * TILE_M + row_in_tile;
+                int global_col = tile_col * TILE_N + n * 8;
 
-                // Write 8 columns per iteration
-                for (int i = 0; i < 8; i++) {
-                    int col = n * 8 + i;
-                    int global_col = tile_col * TILE_N + col;
-                    C[global_row * N + global_col] = __float2bfloat16(tmp[i]);
-                }
+                // Convert 8 floats to 4 bf16x2 pairs and store as int4
+                __nv_bfloat162 out[4];
+                out[0] = __floats2bfloat162_rn(tmp[0], tmp[1]);
+                out[1] = __floats2bfloat162_rn(tmp[2], tmp[3]);
+                out[2] = __floats2bfloat162_rn(tmp[4], tmp[5]);
+                out[3] = __floats2bfloat162_rn(tmp[6], tmp[7]);
+
+                // Store 16 bytes (8 bf16 values) at once
+                __nv_bfloat16* out_ptr = C + global_row * N + global_col;
+                reinterpret_cast<int4*>(out_ptr)[0] = reinterpret_cast<int4*>(out)[0];
             }
         }
 
@@ -587,11 +562,6 @@ CUtensorMap create_tensor_map_3d(
         (cuuint32_t)tile_k / 64                  // TILE_K / 64
     };
     cuuint32_t elementStrides[rank] = {1, 1, 1};
-
-    std::cout << "TMA 3D params: globalDim={" << globalDim[0] << "," << globalDim[1] << "," << globalDim[2] << "}"
-              << " boxDim={" << boxDim[0] << "," << boxDim[1] << "," << boxDim[2] << "}"
-              << " strides={" << globalStrides[0] << "," << globalStrides[1] << "}"
-              << " (128B swizzle)" << std::endl;
 
     CUresult result = cuTensorMapEncodeTiled(
         &tensor_map,
