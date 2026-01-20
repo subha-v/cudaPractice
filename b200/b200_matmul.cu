@@ -8,19 +8,14 @@
 #include <cmath>
 #include <omp.h>
 
-// =============================================================================
-// DEBUGGING UTILITIES
-// =============================================================================
-
-// Device-side assert - triggers trap on failure (use with compute-sanitizer)
+// debug
 __device__ __forceinline__ void dassert(bool condition) {
     if (!condition) {
         asm volatile("trap;");
     }
 }
 
-// Device-side checkpoint marker - writes to global memory for post-mortem analysis
-// checkpoint_buffer should be allocated as: int[gridDim.x * NUM_CHECKPOINTS]
+//debug
 #define NUM_CHECKPOINTS 16
 __device__ __forceinline__ void checkpoint(int* buffer, int checkpoint_id) {
     if (threadIdx.x == 0) {
@@ -28,7 +23,7 @@ __device__ __forceinline__ void checkpoint(int* buffer, int checkpoint_id) {
     }
 }
 
-// Host-side CUDA error checking macro
+
 #define CUDA_CHECK(x) do {                                              \
     cudaError_t err = (x);                                              \
     if (err != cudaSuccess) {                                           \
@@ -49,15 +44,10 @@ __device__ __forceinline__ void checkpoint(int* buffer, int checkpoint_id) {
     }                                                                   \
 } while(0)
 
-// =============================================================================
-// KERNEL CONSTANTS
-// =============================================================================
-
 // We want to launch 148 blocks and have those persistently running on the B200
 // A kernel is executed as a grid of blocks of threads
 // Each CUDA block is executed by one streaming multiprocessor (SM)
 
-// Tile sizes for our matmul
 constexpr int TILE_M = 128;  
 constexpr int TILE_N = 256;  
 constexpr int TILE_K = 64;   
@@ -69,11 +59,9 @@ constexpr int NUM_WORKERS = (NUM_CONSUMERS + NUM_PRODUCERS) * 4;  // 4 warps per
 constexpr int NUM_THREADS = NUM_WORKERS * 32;  // 32 threads per warp = 256 threads
 
 
-// Organized in 512-byte columns: 128 * 256 * 4 bytes = 131072 bytes = 256 columns
-constexpr int TMEM_COLS = 256;  // 128x256 tile * 4 bytes = 131072 bytes = 256 columns
+constexpr int TMEM_COLS = 256;  
 
-// helper function to make tma load from gmem to smem
-// Uses 3D tensor map with coordinates {0, row_offset, k_tile}
+// 3d tensor map
 __device__ __forceinline__ void launch_tma_load(
     int slot,
     int k_tile,
@@ -99,20 +87,14 @@ __device__ __forceinline__ void launch_tma_load(
         : "memory"
     );
 
-    // 3D TMA coordinates: {coord0, coord1, coord2}
-    // Tensor map layout: (64, HEIGHT, K/64)
-    // - coord0 = 0: always start at element 0 within the 64-element block
-    // - coord1 = row offset (tile_row * TILE_M for A, tile_col * TILE_N for B)
-    // - coord2 = k_tile: which K/64 block (since TILE_K=64, this equals k_tile)
-    int a_coord_0 = 0;                        // Always 0 (start of 64-element block)
-    int a_coord_1 = tile_row * TILE_M;        // M dimension offset
-    int a_coord_2 = k_tile;                   // K/64 block index (TILE_K=64, so k_tile directly)
+    int a_coord_0 = 0;                        
+    int a_coord_1 = tile_row * TILE_M;       
+    int a_coord_2 = k_tile;                
+    int b_coord_0 = 0;                      
+    int b_coord_1 = tile_col * TILE_N;       
+    int b_coord_2 = k_tile;                  
 
-    int b_coord_0 = 0;                        // Always 0
-    int b_coord_1 = tile_col * TILE_N;        // N dimension offset
-    int b_coord_2 = k_tile;                   // K/64 block index
-
-    // Launch TMA for A - 3D tensor with 128B swizzle
+    // tma A
     asm volatile(
         "cp.async.bulk.tensor.3d.shared::cta.global.tile.mbarrier::complete_tx::bytes"
         " [%0], [%1, {%2, %3, %4}], [%5];"
@@ -126,7 +108,7 @@ __device__ __forceinline__ void launch_tma_load(
         : "memory"
     );
 
-    // Launch TMA for B - 3D tensor with 128B swizzle
+    // tma B
     asm volatile(
         "cp.async.bulk.tensor.3d.shared::cta.global.tile.mbarrier::complete_tx::bytes"
         " [%0], [%1, {%2, %3, %4}], [%5];"
@@ -146,19 +128,11 @@ __global__ __cluster_dims__(1, 1, 1) void my_matmul_kernel(
     const __grid_constant__ CUtensorMap tensor_map_B,
     __nv_bfloat16* __restrict__ C,
     int M, int N, int K,
-    int* checkpoint_buffer  // Debug: tracks execution progress per block
+    int* checkpoint_buffer   
 ) {
-    // Checkpoint IDs:
-    // 0 = kernel entry
-    // 1 = after barrier init
-    // 2 = before TMEM alloc
-    // 3 = after TMEM alloc
-    // 4 = entering tile loop
-    // 5 = after tile processing
-    // 6 = before TMEM dealloc
-    // 7 = kernel exit
+    
 
-    checkpoint(checkpoint_buffer, 0);  // CHECKPOINT 0: Kernel entry
+    checkpoint(checkpoint_buffer, 0);  
 
     // what thread am i? producer or consumer and which warp am i in
     int warp_id = threadIdx.x / 32;        // Which warp (0-7 for 256 threads)
@@ -180,9 +154,7 @@ __global__ __cluster_dims__(1, 1, 1) void my_matmul_kernel(
     // initialization - barrier init only needs thread 0
     if (threadIdx.x == 0) {
         // Initialize barriers using PTX mbarrier.init
-        // inputs_arrived: 1 arrival (producer's expect_tx, TMA completion is via tx_count)
-        // inputs_finished: 1 arrival (consumer signals done)
-        // mma_mbar: 1 arrival (tcgen05.commit signals when MMA completes)
+       
         for (int i = 0; i < PIPE_DEPTH; i++) {
             uint64_t* arrived_ptr = &inputs_arrived_storage[i];
             uint64_t* finished_ptr = &inputs_finished_storage[i];
@@ -195,33 +167,27 @@ __global__ __cluster_dims__(1, 1, 1) void my_matmul_kernel(
                 :: "l"(__cvta_generic_to_shared(finished_ptr)), "r"(1)
             );
         }
-        // Initialize MMA completion barrier
+      // mma completion barrier
         asm volatile(
             "mbarrier.init.shared.b64 [%0], %1;"
             :: "l"(__cvta_generic_to_shared(mma_mbar)), "r"(1)
         );
-        // CRITICAL: Make barrier init visible to async proxy (TMA hardware)
+        // MAKE BARRIER VISIBLE YAY
         asm volatile("fence.mbarrier_init.release.cluster;");
     }
     __syncthreads();  // Ensure barriers are initialized before TMEM alloc
 
-    checkpoint(checkpoint_buffer, 1);  // CHECKPOINT 1: After barrier init
+    checkpoint(checkpoint_buffer, 1);  
 
-    // TMEM allocation - tcgen05.alloc with cta_group::1 is a WARP-collective operation
+   
     // Only ONE warp (32 threads) should execute it, not a warpgroup!
 
-    checkpoint(checkpoint_buffer, 2);  // CHECKPOINT 2: Before TMEM alloc
+    checkpoint(checkpoint_buffer, 2);  
     __syncthreads();
 
     uint32_t num_cols = TMEM_COLS;
 
-    // DEBUG printfs removed for performance - they serialize GPU execution
-    // tmem_base = 0 is valid (start of tensor memory address space)
-
-    // tcgen05.alloc writes the allocated TMEM address to shared memory at [dst]
-    // Per PTX docs: "When .cta_group::1 is specified, one warp from the CTA must perform the allocation"
-    // Use warp 1 (not warp 0) for allocation - matching example code pattern
-    // The PTX examples show using ld.shared.b32 to read the result after alloc
+    // use warp 1 like the example ig
     if (threadIdx.x >= 32 && threadIdx.x < 64) {  // warp 1
         const int addr = static_cast<int>(__cvta_generic_to_shared(tmem_base));
         asm volatile(
@@ -230,20 +196,20 @@ __global__ __cluster_dims__(1, 1, 1) void my_matmul_kernel(
             : "memory"
         );
     }
-    __syncthreads();  // Ensure all threads see the allocated tmem_base
+    __syncthreads();  // ensure everyone got tmem base
 
-    checkpoint(checkpoint_buffer, 3);  // CHECKPOINT 3: After TMEM alloc
+    checkpoint(checkpoint_buffer, 3);   
 
     int num_tiles_m = M / TILE_M;
     int num_tiles_n = N / TILE_N;
     int num_k_tiles = K / TILE_K;
     int total_tiles = num_tiles_m * num_tiles_n;
 
-    // MMA completion tracking - shared memory address for mbarrier
+    
     const uint32_t mma_mbar_addr = static_cast<uint32_t>(__cvta_generic_to_shared(mma_mbar));
-    int mma_phase = 0;  // Alternates 0,1,0,1... for each k_tile
+    int mma_phase = 0;  // alternates 0/1
 
-    checkpoint(checkpoint_buffer, 4);  // CHECKPOINT 4: Entering tile loop
+    checkpoint(checkpoint_buffer, 4);   
 
     // each block processes multiple output tiles
     // note that blockIdx.x  goes from 1 to 148
@@ -258,23 +224,20 @@ __global__ __cluster_dims__(1, 1, 1) void my_matmul_kernel(
 
         // 1 thread of the producer loads the first tiles
         // Prefetch PIPE_DEPTH - 1 tiles, leaving one slot free for the main loop
-        // This matches the pattern from example_kernel.cu and prevents barrier violations:
-        // If we prefetch all PIPE_DEPTH slots, the first main loop iteration would
-        // try to arrive on a barrier that was already arrived on during prefetch.
-        if (wg_id == 1 && threadIdx.x == 128) {  // First thread of producer warpgroup
-            int prefetch_count = min(PIPE_DEPTH - 1, num_k_tiles); // Leave one slot free
+
+        if (wg_id == 1 && threadIdx.x == 128) {  
+            int prefetch_count = min(PIPE_DEPTH - 1, num_k_tiles); 
             for (int k_tile = 0; k_tile < prefetch_count; k_tile++) {
                 int slot = k_tile % PIPE_DEPTH;
-                launch_tma_load( // loads in tiles A and B to SMEM
+                launch_tma_load(  // loads A and B
                     slot, k_tile, tile_row, tile_col,
                     a_smem, b_smem,
-                    &inputs_arrived_storage[slot],  // raw mbarrier storage
+                    &inputs_arrived_storage[slot],  
                     &tensor_map_A, &tensor_map_B
                 );
             }
         }
 
-        // Ensure prefetch TMA loads are issued before consumer starts waiting
         __syncthreads();
 
         // we split up the tiles of  A and B into further tiles
@@ -297,10 +260,10 @@ __global__ __cluster_dims__(1, 1, 1) void my_matmul_kernel(
                     uint64_t* barrier_ptr = &inputs_arrived_storage[compute_slot];
                     uint32_t barrier_addr = static_cast<uint32_t>(__cvta_generic_to_shared(barrier_ptr));
 
-                    // Phase bit alternates 0,1,0,1... for each use of the barrier
+                    //  phase bit alternates
                     uint32_t phase = (k_tile / PIPE_DEPTH) & 1;
 
-                    // Wait for TMA completion (no arrive - producer already signaled)
+                    // wait for TMA completion
                     asm volatile(
                         "{\n\t"
                         ".reg .pred p;\n\t"
@@ -313,8 +276,7 @@ __global__ __cluster_dims__(1, 1, 1) void my_matmul_kernel(
                 }
                 __syncwarp();  // Ensure all threads in warp 0 know data is ready
 
-                // Only thread 0 of the entire CTA issues the tcgen05.mma instruction
-                // Per NVIDIA docs: "Unlike WGMMA, only one thread is used to launch UMMA"
+                // only one thread is needed
                 if (threadIdx.x == 0) {
                     // Fence before tcgen05 operations to ensure memory ordering
                     asm volatile("tcgen05.fence::before_thread_sync;");
@@ -323,9 +285,7 @@ __global__ __cluster_dims__(1, 1, 1) void my_matmul_kernel(
                     uint32_t a_addr = __cvta_generic_to_shared(a_smem[compute_slot]);
                     uint32_t b_addr = __cvta_generic_to_shared(b_smem[compute_slot]);
 
-                    // Build instruction descriptor for tcgen05.mma
-                    // Table 42: .kind::f16 format for bf16 inputs, f32 output
-                    // M=128, N=256, K=16
+                    // build instruction descriptor
                     uint32_t idesc = 0;
                     idesc |= (1 << 4);    // bits 4-5: dtype = F32
                     idesc |= (1 << 7);    // bits 7-9: atype = BF16
@@ -333,17 +293,7 @@ __global__ __cluster_dims__(1, 1, 1) void my_matmul_kernel(
                     idesc |= (32 << 17);  // bits 17-22: N >> 3 = 256 >> 3 = 32
                     idesc |= (8 << 24);   // bits 24-28: M >> 4 = 128 >> 4 = 8
 
-                    // SMEM descriptor format (from PTX docs 9.7.16.4.1):
-                    // Bits 0-13:   matrix-descriptor-encode(start address)
-                    // Bits 16-29:  matrix-descriptor-encode(LBO) - not used with 128B swizzle
-                    // Bits 32-45:  matrix-descriptor-encode(SBO) - stride byte offset
-                    // Bits 46-48:  Fixed constant 0b001
-                    // Bits 49-51:  Matrix base offset (0 for 1024-byte aligned)
-                    // Bit 52:      Leading dimension stride mode (0 = relative)
-                    // Bits 53-60:  Fixed constant 0x00
-                    // Bits 61-63:  Swizzle mode (2 = 128-byte swizzle)
-                    //
-                    // matrix-descriptor-encode(x) = (x & 0x3FFFF) >> 4
+                   
 
                     // Helper lambda for descriptor encoding
                     auto desc_encode = [](uint32_t x) -> uint64_t {
@@ -354,7 +304,7 @@ __global__ __cluster_dims__(1, 1, 1) void my_matmul_kernel(
                     // This is the stride to the next swizzle block
                     constexpr uint32_t SBO = 8 * 128;  // 1024 bytes
 
-                    // Make SMEM descriptor with 128B swizzle (mode 2)
+                    // Make SMEM descriptor with 128B swizzle  
                     auto make_desc = [&](uint32_t addr) -> uint64_t {
                         return desc_encode(addr)              // bits 0-13: encoded address
                              | (desc_encode(SBO) << 32)       // bits 32-45: encoded SBO
@@ -362,10 +312,7 @@ __global__ __cluster_dims__(1, 1, 1) void my_matmul_kernel(
                              | (2ULL << 61);                  // bits 61-63: 128B swizzle
                     };
 
-                    // tcgen05.mma for 128x256 output tile with K=64
-                    // Each tcgen05.mma handles M=128, N=256, K=16
-                    // With TILE_K=64, we need 64/16 = 4 k-steps
-                    // Each k-step advances by 32 bytes (16 bf16 elements * 2 bytes)
+                    // tcgen05.mma 
                     constexpr int MMA_K = 16;
 
                     #pragma unroll
@@ -426,22 +373,12 @@ __global__ __cluster_dims__(1, 1, 1) void my_matmul_kernel(
 
             // Producer loads the next tile (runs in parallel with consumer's WGMMA!)
             if (wg_id == 1 && threadIdx.x == 128 && load_k_tile < num_k_tiles) {
-                // Wait for consumer to finish with the slot we're about to reuse
-                // With PIPE_DEPTH-1 prefetch: slots 0..(PIPE_DEPTH-2) were used by prefetch,
-                // slot (PIPE_DEPTH-1) is empty. So first load (k_tile=0) goes to empty slot,
-                // but k_tile>=1 needs to wait for consumer to finish.
-                // Condition: load_k_tile >= PIPE_DEPTH means we're reusing a previously-loaded slot
+               
                 if (load_k_tile >= PIPE_DEPTH) {
                     uint64_t* barrier_ptr = &inputs_finished_storage[load_slot];
                     uint32_t barrier_addr = static_cast<uint32_t>(__cvta_generic_to_shared(barrier_ptr));
 
-                    // Phase bit for this barrier
-                    // With PIPE_DEPTH-1 prefetch:
-                    // - First wait on slot 0 happens at k_tile=1 (load_k_tile=4), phase should be 0
-                    // - Second wait on slot 0 happens at k_tile=5 (load_k_tile=8), phase should be 1
-                    // The consumer signals finished[slot] at k_tile = slot, slot+PIPE_DEPTH, ...
-                    // We wait at k_tile = slot+1, slot+1+PIPE_DEPTH, ...
-                    // Phase = ((k_tile - 1) / PIPE_DEPTH) & 1
+                  
                     uint32_t phase = ((k_tile - 1) / PIPE_DEPTH) & 1;
 
                     // Producer only waits - consumer signals via arrive
@@ -464,9 +401,6 @@ __global__ __cluster_dims__(1, 1, 1) void my_matmul_kernel(
                 );
             }
 
-            // Wait for MMA completion (signaled by tcgen05.commit)
-            // This wait allows proper pipelining - we issue MMA+commit, then wait
-            // All threads must wait since they all need to know MMA is complete
             if (threadIdx.x == 0) {
                 asm volatile(
                     "{\n\t"
@@ -478,28 +412,14 @@ __global__ __cluster_dims__(1, 1, 1) void my_matmul_kernel(
                     :: "r"(mma_mbar_addr), "r"(mma_phase) : "memory"
                 );
             }
-            mma_phase ^= 1;  // Flip phase for next k_tile
+            mma_phase ^= 1;  // flip phase
         }
-
-        // Fence required after all MMAs complete, before reading from TMEM
-        // tcgen05.fence ensures all tcgen05 operations issued by this thread are complete
         asm volatile("tcgen05.fence::after_thread_sync;");
 
-        // Now sync all threads - after this, all threads know MMA is complete
+      
         __syncthreads();
 
-        // =====================================================================
-        // EPILOGUE: TMEM → SMEM transpose → Global Memory (COALESCED)
-        // =====================================================================
-        // Problem: tcgen05.ld returns data organized by rows (each thread owns one row).
-        // Writing row-major matrix C with this mapping causes strided accesses:
-        //   Thread 0 → row 0, Thread 1 → row 1, etc. (N elements apart = terrible!)
-        //
-        // Solution: Transpose via SMEM so threads write consecutive columns of SAME row.
-        // After transpose: each warp writes one row, 32 lanes write 8 consecutive cols each.
-        //
-        // Reuse a_smem as float buffer (64KB available, need 128×256×4 = 128KB)
-        // Process in 2 halves: columns 0-127, then 128-255
+        // epilogue
 
         float* output_smem = reinterpret_cast<float*>(a_smem[0]);  // 64KB = 16K floats = 128×128
 
@@ -507,8 +427,6 @@ __global__ __cluster_dims__(1, 1, 1) void my_matmul_kernel(
         for (int col_half = 0; col_half < 2; col_half++) {
             int col_base = col_half * 128;  // 0 or 128
 
-            // Step 1: Load 128 TMEM columns to SMEM (all 128 threads participate)
-            // Each warp loads its 32 rows for 128 columns (16 chunks of 8)
             if (wg_id == 0) {
                 int warp_id = threadIdx.x / 32;
                 int lane_id = threadIdx.x % 32;
@@ -536,9 +454,6 @@ __global__ __cluster_dims__(1, 1, 1) void my_matmul_kernel(
             }
             __syncthreads();
 
-            // Step 2: Write from SMEM to global with COALESCED access pattern
-            // New mapping: each warp writes ONE row, 32 lanes write consecutive 8-col chunks
-            // This gives perfect coalescing: 32 threads × 16 bytes = 512 bytes consecutive
             if (wg_id == 0) {
                 int warp_id = threadIdx.x / 32;
                 int lane_id = threadIdx.x % 32;
@@ -570,11 +485,11 @@ __global__ __cluster_dims__(1, 1, 1) void my_matmul_kernel(
             __syncthreads();
         }
 
-        // Sync before next output tile
+    
         __syncthreads();
     }
 
-    checkpoint(checkpoint_buffer, 5);  // CHECKPOINT 5: After tile processing
+    checkpoint(checkpoint_buffer, 5);  
 
     // deallocate tmem - tcgen05.dealloc with cta_group::1 needs only ONE warp
     __syncthreads();  // Ensure all threads are done before dealloc
@@ -593,7 +508,7 @@ __global__ __cluster_dims__(1, 1, 1) void my_matmul_kernel(
         );
     }
 
-    checkpoint(checkpoint_buffer, 7);  // CHECKPOINT 7: Kernel exit
+    checkpoint(checkpoint_buffer, 7);  
 }
 
 
@@ -609,16 +524,11 @@ CUtensorMap create_tensor_map_3d(
 ) {
     CUtensorMap tensor_map;
 
-    // 3D tensor map: (64, height, K/64)
-    // - Dimension 0: 64 elements (128 bytes for bf16) - the swizzle unit
-    // - Dimension 1: height (M or N rows)
-    // - Dimension 2: K/64 (number of 64-element K chunks)
+    
     constexpr uint32_t rank = 3;
     cuuint64_t globalDim[rank] = {64, (cuuint64_t)height, (cuuint64_t)K / 64};
 
-    // Strides in bytes:
-    // - stride[0]: bytes to next row = K * sizeof(bf16)
-    // - stride[1]: bytes to next K/64 block = 128 bytes (64 elements * 2)
+   
     cuuint64_t globalStrides[rank-1] = {
         (cuuint64_t)K * sizeof(__nv_bfloat16),  // stride to next row
         128                                      // stride between 64-element K blocks
