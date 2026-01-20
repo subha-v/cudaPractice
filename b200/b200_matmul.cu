@@ -134,7 +134,7 @@ __device__ __forceinline__ void launch_tma_load(
     );
 }
 
-__global__ void my_matmul_kernel(
+__global__ __cluster_dims__(1, 1, 1) void my_matmul_kernel(
     const __grid_constant__ CUtensorMap tensor_map_A,
     const __grid_constant__ CUtensorMap tensor_map_B,
     __nv_bfloat16* __restrict__ C,
