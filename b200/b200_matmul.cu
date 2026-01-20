@@ -499,7 +499,8 @@ __global__ __cluster_dims__(1, 1, 1) void my_matmul_kernel(
                 int col = warp_in_consumer * cols_per_warp + col_idx;
 
                 // all threads in warp use the SAME taddr (base of this column)
-                uint32_t taddr = tmem_base[0] + col * 512;  // 512 bytes per column
+                // taddr is the column number, not byte offset
+                uint32_t taddr = tmem_base[0] + col;
 
                 // Collective load: each thread receives 4 floats from the column
                 float r0, r1, r2, r3;
