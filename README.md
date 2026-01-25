@@ -1,4 +1,14 @@
+
+
 # CUDA practice
+
+
+## B200 Matmul Kernel
+
+Make sure to run it with this command, otherwise it will be so slow.
+`nvcc -O3 -gencode arch=compute_100a,code=sm_100a b200_matmul.cu -o b200_matmul -lcuda -lcudart`
+
+Currently achieves 842.371 TFLOPs on the B200, could be further optimized
 
 ## Matmul Naive
 The slow part is the loads for A and B (e.g. A[row * N + k]) because that accesses the HBM to load that specific element in A

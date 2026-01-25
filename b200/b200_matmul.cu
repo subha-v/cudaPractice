@@ -524,11 +524,9 @@ CUtensorMap create_tensor_map_3d(
 ) {
     CUtensorMap tensor_map;
 
-    
     constexpr uint32_t rank = 3;
     cuuint64_t globalDim[rank] = {64, (cuuint64_t)height, (cuuint64_t)K / 64};
 
-   
     cuuint64_t globalStrides[rank-1] = {
         (cuuint64_t)K * sizeof(__nv_bfloat16),  // stride to next row
         128                                      // stride between 64-element K blocks
