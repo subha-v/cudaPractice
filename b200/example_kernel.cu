@@ -11,7 +11,7 @@ constexpr int MMA_K = 16;
 template <int BLOCK_N, int BLOCK_K, int NUM_STAGES>
 __global__
 __launch_bounds__(TB_SIZE)
-void matmul_v3_kernel(
+void matmul_v4_kernel(
   const __grid_constant__ CUtensorMap A_tmap,
   const __grid_constant__ CUtensorMap B_tmap,
   nv_bfloat16 *C_ptr,
@@ -38,18 +38,20 @@ void matmul_v3_kernel(
   constexpr int B_size = BLOCK_N * BLOCK_K * sizeof(nv_bfloat16);
 
   // set up mbarrier and tmem
-  // TODO: check if speed is slower if mbar is a variable instead of an array
+  // we have NUM_STAGES mbars for TMA
+  //         NUM_STAGES mbars for MMA
+  //                  1 mbar for epilgoue
   #pragma nv_diag_suppress static_var_with_dynamic_init
-  __shared__ uint64_t tma_mbars[NUM_STAGES];
-  __shared__ uint64_t mma_mbars[1];
+  __shared__ uint64_t mbars[NUM_STAGES * 2 + 1];
   __shared__ int tmem_addr[1];  // tmem address is 32-bit
-  const int tma_mbar_addr = static_cast<int>(__cvta_generic_to_shared(tma_mbars));
-  const int mma_mbar_addr = static_cast<int>(__cvta_generic_to_shared(mma_mbars));
+  const int tma_mbar_addr = static_cast<int>(__cvta_generic_to_shared(mbars));
+  const int mma_mbar_addr = tma_mbar_addr + NUM_STAGES * 8;
+  const int mainloop_mbar_addr = mma_mbar_addr + NUM_STAGES * 8;
 
   if (warp_id == 0 && elect_sync()) {
-    for (int i = 0; i < NUM_STAGES; i++)
-      mbarrier_init(tma_mbar_addr + i * 8, 1);  // only 1 thread issue
-    mbarrier_init(mma_mbar_addr, 1);  // only 1 thread issue
+    // only 1 thread issue
+    for (int i = 0; i < NUM_STAGES * 2 + 1; i++)
+      mbarrier_init(tma_mbar_addr + i * 8, 1);
     asm volatile("fence.mbarrier_init.release.cluster;");  // visible to async proxy
   }
   else if (warp_id == 1) {
@@ -61,8 +63,7 @@ void matmul_v3_kernel(
   __syncthreads();  // visible to all threads
   const int taddr = tmem_addr[0];  // this will be 0
 
-  int tma_phase = 0;
-  int mma_phase = 0;
+  int phase = 0;
 
   // https://docs.nvidia.com/cuda/parallel-thread-execution/#tcgen05-instruction-descriptor
   constexpr uint32_t i_desc = (1U << 4U)   // dtype=FP32
@@ -73,87 +74,86 @@ void matmul_v3_kernel(
                             ;
 
   auto load = [&](int iter_k) {
-    if (warp_id == 0 && elect_sync()) {
-      const int stage_id = iter_k % NUM_STAGES;
-      const int mbar_addr = tma_mbar_addr + stage_id * 8;
-      const int A_smem = smem + stage_id * (A_size + B_size);
-      const int B_smem = A_smem + A_size;
+    // wait for MMA
+    // the initial TMA phase is 0, and it is available. so we wait for 1 instead.
+    const int stage_id = iter_k % NUM_STAGES;
+    mbarrier_wait(mma_mbar_addr + stage_id * 8, phase ^ 1);
 
-      const int off_k = iter_k * BLOCK_K;
-      tma_3d_gmem2smem(A_smem, &A_tmap, 0, off_m, off_k / 64, mbar_addr);
-      tma_3d_gmem2smem(B_smem, &B_tmap, 0, off_n, off_k / 64, mbar_addr);
-      asm volatile("mbarrier.arrive.expect_tx.release.cta.shared::cta.b64 _, [%0], %1;"
-                  :: "r"(mbar_addr), "r"(A_size + B_size) : "memory");
-    }
+    // flip phase when we have cycled through all TMA buffers
+    if (stage_id == NUM_STAGES - 1)
+      phase ^= 1;
+
+    const int mbar_addr = tma_mbar_addr + stage_id * 8;
+    const int A_smem = smem + stage_id * (A_size + B_size);
+    const int B_smem = A_smem + A_size;
+
+    const int off_k = iter_k * BLOCK_K;
+    tma_3d_gmem2smem(A_smem, &A_tmap, 0, off_m, off_k / 64, mbar_addr);
+    tma_3d_gmem2smem(B_smem, &B_tmap, 0, off_n, off_k / 64, mbar_addr);
+    asm volatile("mbarrier.arrive.expect_tx.release.cta.shared::cta.b64 _, [%0], %1;"
+                :: "r"(mbar_addr), "r"(A_size + B_size) : "memory");
   };
 
   auto compute = [&](int iter_k) {
     // wait for TMA
     const int stage_id = iter_k % NUM_STAGES;
-    const int mbar_addr = tma_mbar_addr + stage_id * 8;
-    mbarrier_wait(mbar_addr, tma_phase);
+    mbarrier_wait(tma_mbar_addr + stage_id * 8, phase);
     asm volatile("tcgen05.fence::after_thread_sync;");  // (why) do we need this? from DeepGEMM
+
+    // flip phase when we have cycled through all TMA buffers
+    if (stage_id == NUM_STAGES - 1)
+      phase ^= 1;
 
     const int A_smem = smem + stage_id * (A_size + B_size);
     const int B_smem = A_smem + A_size;
 
-    // flip TMA phase when we have cycled through all TMA buffers
-    if (stage_id == NUM_STAGES - 1)
-      tma_phase ^= 1;
+    // set up shared memory descriptors for A and B
+    // https://docs.nvidia.com/cuda/parallel-thread-execution/#tcgen05-shared-memory-descriptor
+    // 128-byte swizzling. LBO is implied to be 1.
+    auto make_desc = [](int addr) -> uint64_t {
+      const int SBO = 8 * 128;
+      return desc_encode(addr) | (desc_encode(SBO) << 32ULL) | (1ULL << 46ULL) | (2ULL << 61ULL);
+    };
 
-    // MMA
-    if (warp_id == 0 && elect_sync()) {
-      // set up shared memory descriptors for A and B
-      // https://docs.nvidia.com/cuda/parallel-thread-execution/#tcgen05-shared-memory-descriptor
-      // 128-byte swizzling. LBO is implied to be 1.
-      auto make_desc = [](int addr) -> uint64_t {
-        const int SBO = 8 * 128;
-        return desc_encode(addr) | (desc_encode(SBO) << 32ULL) | (1ULL << 46ULL) | (2ULL << 61ULL);
-      };
-
-      // manually unroll 1st iteration to disable accumulation
-      {
-        tcgen05_mma_f16(taddr, make_desc(A_smem), make_desc(B_smem), i_desc, iter_k);
-        for (int k2 = 1; k2 < 64 / MMA_K; k2++) {
-          uint64_t a_desc = make_desc(A_smem + k2 * 32);
-          uint64_t b_desc = make_desc(B_smem + k2 * 32);
-          tcgen05_mma_f16(taddr, a_desc, b_desc, i_desc, 1);
-        }
+    // manually unroll 1st iteration to disable accumulation
+    {
+      tcgen05_mma_f16(taddr, make_desc(A_smem), make_desc(B_smem), i_desc, iter_k);
+      for (int k2 = 1; k2 < 64 / MMA_K; k2++) {
+        uint64_t a_desc = make_desc(A_smem + k2 * 32);
+        uint64_t b_desc = make_desc(B_smem + k2 * 32);
+        tcgen05_mma_f16(taddr, a_desc, b_desc, i_desc, 1);
       }
-      // k1 selects the (BLOCK_M, 64) tile.
-      // k2 selects the (BLOCK_M, 16) tile, whose rows are swizzled.
-      for (int k1 = 1; k1 < BLOCK_K / 64; k1++)
-        for (int k2 = 0; k2 < 64 / MMA_K; k2++) {
-          uint64_t a_desc = make_desc(A_smem + k1 * BLOCK_M * 128 + k2 * 32);
-          uint64_t b_desc = make_desc(B_smem + k1 * BLOCK_N * 128 + k2 * 32);
-          tcgen05_mma_f16(taddr, a_desc, b_desc, i_desc, 1);
-        }
-      asm volatile("tcgen05.commit.cta_group::1.mbarrier::arrive::one.shared::cluster.b64 [%0];"
-                  :: "r"(mma_mbar_addr) : "memory");
     }
+    // k1 selects the (BLOCK_M, 64) tile.
+    // k2 selects the (BLOCK_M, 16) tile, whose rows are swizzled.
+    for (int k1 = 1; k1 < BLOCK_K / 64; k1++)
+      for (int k2 = 0; k2 < 64 / MMA_K; k2++) {
+        uint64_t a_desc = make_desc(A_smem + k1 * BLOCK_M * 128 + k2 * 32);
+        uint64_t b_desc = make_desc(B_smem + k1 * BLOCK_N * 128 + k2 * 32);
+        tcgen05_mma_f16(taddr, a_desc, b_desc, i_desc, 1);
+      }
+    asm volatile("tcgen05.commit.cta_group::1.mbarrier::arrive::one.shared::cluster.b64 [%0];"
+                :: "r"(mma_mbar_addr + stage_id * 8) : "memory");
   };
 
   const int num_iters = K / BLOCK_K;
-
-  // prefetch
-  for (int i = 0; i < NUM_STAGES - 1; i++)
-    load(i);
-
-  for (int iter_k = 0; iter_k < num_iters - NUM_STAGES + 1; iter_k++) {
-    load(iter_k + NUM_STAGES - 1);
-    compute(iter_k);
-
-    // wait for MMA
-    mbarrier_wait(mma_mbar_addr, mma_phase);
-    mma_phase ^= 1;  // flip the phase
+  if (warp_id == 0 && elect_sync()) {
+    // TMA warp
+    for (int iter_k = 0; iter_k < num_iters; iter_k++)
+      load(iter_k);
   }
+  else if (warp_id == 1 && elect_sync()) {
+    // MMA warp
+    for (int iter_k = 0; iter_k < num_iters; iter_k++)
+      compute(iter_k);
 
-  // finish the last few buffers
-  for (int iter_k = num_iters - NUM_STAGES + 1; iter_k < num_iters; iter_k++) {
-    compute(iter_k);
-    mbarrier_wait(mma_mbar_addr, mma_phase);
-    mma_phase ^= 1;  // flip the phase
+    // signal when tcgen05 finishes with the main loop
+    asm volatile("tcgen05.commit.cta_group::1.mbarrier::arrive::one.shared::cluster.b64 [%0];"
+                :: "r"(mainloop_mbar_addr) : "memory");
   }
+  __syncthreads();  // wait for all warps to reach here
+  // wait for mainloop to finish
+  mbarrier_wait(mainloop_mbar_addr, 0);
 
   // PTX doc says we need to add this before tcgen05.ld, after tcgen05.mma
   asm volatile("tcgen05.fence::after_thread_sync;");
@@ -185,7 +185,7 @@ void matmul_v3_kernel(
 }
 
 template <int BLOCK_N, int BLOCK_K, int NUM_STAGES>
-void matmul_v3_launch(
+void matmul_v4_launch(
   const nv_bfloat16 *A_ptr,
   const nv_bfloat16 *B_ptr,
         nv_bfloat16 *C_ptr,
@@ -226,18 +226,18 @@ void matmul_v3_launch(
   int size_AB = (BLOCK_M + BLOCK_N) * BLOCK_K * NUM_STAGES;
   int smem_size = size_AB * sizeof(nv_bfloat16);
 
-  auto this_kernel = matmul_v3_kernel<BLOCK_N, BLOCK_K, NUM_STAGES>;
+  auto this_kernel = matmul_v4_kernel<BLOCK_N, BLOCK_K, NUM_STAGES>;
   if (smem_size > 48'000)
     cudaFuncSetAttribute(this_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
 
   this_kernel<<<grid, TB_SIZE, smem_size>>>(A_tmap, B_tmap, C_ptr, M, N, K);
 }
 
-void matmul_v3(
+void matmul_v4(
   const nv_bfloat16 *A_ptr,
   const nv_bfloat16 *B_ptr,
         nv_bfloat16 *C_ptr,
   int M, int N, int K
 ) {
-  matmul_v3_launch<256, 128, 2>(A_ptr, B_ptr, C_ptr, M, N, K);
+  matmul_v4_launch<128, 64, 7>(A_ptr, B_ptr, C_ptr, M, N, K);
 }

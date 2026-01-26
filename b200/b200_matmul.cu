@@ -59,69 +59,7 @@ constexpr int NUM_WORKERS = (NUM_CONSUMERS + NUM_PRODUCERS) * 4;  // 4 warps per
 constexpr int NUM_THREADS = NUM_WORKERS * 32;  // 32 threads per warp = 256 threads
 
 
-constexpr int TMEM_COLS = 256;  
-
-// 3d tensor map
-__device__ __forceinline__ void launch_tma_load(
-    int slot,
-    int k_tile,
-    int tile_row,
-    int tile_col,
-    __nv_bfloat16 a_smem[][TILE_M * TILE_K],
-    __nv_bfloat16 b_smem[][TILE_K * TILE_N],
-    uint64_t* barrier,      // raw mbarrier storage pointer
-    const CUtensorMap* tensor_map_A,
-    const CUtensorMap* tensor_map_B
-) {
-    // Calculate expected bytes for barrier
-    uint32_t bytes_A = TILE_M * TILE_K * sizeof(__nv_bfloat16);
-    uint32_t bytes_B = TILE_K * TILE_N * sizeof(__nv_bfloat16);
-    uint32_t expected_bytes = bytes_A + bytes_B;
-
-    // Signal barrier with expected transaction bytes using PTX
-    uint32_t barrier_addr = static_cast<uint32_t>(__cvta_generic_to_shared(barrier));
-    asm volatile(
-        "mbarrier.arrive.expect_tx.release.cta.shared::cta.b64 _, [%0], %1;"
-        :
-        : "r"(barrier_addr), "r"(expected_bytes)
-        : "memory"
-    );
-
-    int a_coord_0 = 0;                        
-    int a_coord_1 = tile_row * TILE_M;       
-    int a_coord_2 = k_tile;                
-    int b_coord_0 = 0;                      
-    int b_coord_1 = tile_col * TILE_N;       
-    int b_coord_2 = k_tile;                  
-
-    // tma A
-    asm volatile(
-        "cp.async.bulk.tensor.3d.shared::cta.global.tile.mbarrier::complete_tx::bytes"
-        " [%0], [%1, {%2, %3, %4}], [%5];"
-        :
-        : "r"((uint32_t)__cvta_generic_to_shared(a_smem[slot])),
-          "l"(tensor_map_A),
-          "r"(a_coord_0),     // coordinate 0: always 0
-          "r"(a_coord_1),     // coordinate 1: M offset
-          "r"(a_coord_2),     // coordinate 2: K/64 block
-          "r"((uint32_t)barrier_addr)
-        : "memory"
-    );
-
-    // tma B
-    asm volatile(
-        "cp.async.bulk.tensor.3d.shared::cta.global.tile.mbarrier::complete_tx::bytes"
-        " [%0], [%1, {%2, %3, %4}], [%5];"
-        :
-        : "r"((uint32_t)__cvta_generic_to_shared(b_smem[slot])),
-          "l"(tensor_map_B),
-          "r"(b_coord_0),     // coordinate 0: always 0
-          "r"(b_coord_1),     // coordinate 1: N offset
-          "r"(b_coord_2),     // coordinate 2: K/64 block
-          "r"((uint32_t)barrier_addr)
-        : "memory"
-    );
-}
+constexpr int TMEM_COLS = 256;
 
 __global__ __cluster_dims__(1, 1, 1) void my_matmul_kernel(
     const __grid_constant__ CUtensorMap tensor_map_A,
@@ -147,32 +85,27 @@ __global__ __cluster_dims__(1, 1, 1) void my_matmul_kernel(
     __shared__ int tmem_base[1];  // tmem address is 32-bit
 
     // barriers - raw PTX mbarrier storage (NOT cuda::barrier - they're incompatible!)
-    __shared__ alignas(8) uint64_t inputs_arrived_storage[PIPE_DEPTH];
-    __shared__ alignas(8) uint64_t inputs_finished_storage[PIPE_DEPTH];
-    __shared__ alignas(8) uint64_t mma_mbar[1];  // For async MMA completion tracking
+    // Per-stage barriers for pipelined execution:
+    //   - tma_mbar[PIPE_DEPTH]: TMA completion per stage (producer signals, consumer waits)
+    //   - mma_mbar[PIPE_DEPTH]: MMA completion per stage (consumer signals, producer waits for reuse)
+    //   - mainloop_mbar[1]: Final MMA completion for epilogue
+    __shared__ alignas(8) uint64_t tma_mbar[PIPE_DEPTH];      // TMA arrival barriers
+    __shared__ alignas(8) uint64_t mma_mbar[PIPE_DEPTH];      // MMA completion barriers (per-stage!)
+    __shared__ alignas(8) uint64_t mainloop_mbar[1];          // Final completion for epilogue
 
     // initialization - barrier init only needs thread 0
     if (threadIdx.x == 0) {
-        // Initialize barriers using PTX mbarrier.init
-       
+        // Initialize all barriers using PTX mbarrier.init
         for (int i = 0; i < PIPE_DEPTH; i++) {
-            uint64_t* arrived_ptr = &inputs_arrived_storage[i];
-            uint64_t* finished_ptr = &inputs_finished_storage[i];
-            asm volatile(
-                "mbarrier.init.shared.b64 [%0], %1;"
-                :: "l"(__cvta_generic_to_shared(arrived_ptr)), "r"(1)
-            );
-            asm volatile(
-                "mbarrier.init.shared.b64 [%0], %1;"
-                :: "l"(__cvta_generic_to_shared(finished_ptr)), "r"(1)
-            );
+            uint32_t tma_addr = static_cast<uint32_t>(__cvta_generic_to_shared(&tma_mbar[i]));
+            uint32_t mma_addr = static_cast<uint32_t>(__cvta_generic_to_shared(&mma_mbar[i]));
+            asm volatile("mbarrier.init.shared.b64 [%0], %1;" :: "r"(tma_addr), "r"(1));
+            asm volatile("mbarrier.init.shared.b64 [%0], %1;" :: "r"(mma_addr), "r"(1));
         }
-      // mma completion barrier
-        asm volatile(
-            "mbarrier.init.shared.b64 [%0], %1;"
-            :: "l"(__cvta_generic_to_shared(mma_mbar)), "r"(1)
-        );
-        // MAKE BARRIER VISIBLE YAY
+        // mainloop completion barrier
+        uint32_t mainloop_addr = static_cast<uint32_t>(__cvta_generic_to_shared(mainloop_mbar));
+        asm volatile("mbarrier.init.shared.b64 [%0], %1;" :: "r"(mainloop_addr), "r"(1));
+        // MAKE BARRIER VISIBLE
         asm volatile("fence.mbarrier_init.release.cluster;");
     }
     __syncthreads();  // Ensure barriers are initialized before TMEM alloc
@@ -205,219 +138,237 @@ __global__ __cluster_dims__(1, 1, 1) void my_matmul_kernel(
     int num_k_tiles = K / TILE_K;
     int total_tiles = num_tiles_m * num_tiles_n;
 
-    
-    const uint32_t mma_mbar_addr = static_cast<uint32_t>(__cvta_generic_to_shared(mma_mbar));
-    int mma_phase = 0;  // alternates 0/1
+    // Compute barrier base addresses for efficient addressing
+    const uint32_t tma_mbar_base = static_cast<uint32_t>(__cvta_generic_to_shared(tma_mbar));
+    const uint32_t mma_mbar_base = static_cast<uint32_t>(__cvta_generic_to_shared(mma_mbar));
+    const uint32_t mainloop_mbar_addr = static_cast<uint32_t>(__cvta_generic_to_shared(mainloop_mbar));
+
+    // Phase tracking - alternates 0/1 as we cycle through stages
+    int phase = 0;
+    int mainloop_phase = 0;  // Tracks mainloop barrier phase across tiles
+
 
     checkpoint(checkpoint_buffer, 4);   
 
+    // Build instruction descriptor once (constant across all tiles)
+    constexpr uint32_t idesc = (1U << 4U)    // bits 4-5: dtype = F32
+                             | (1U << 7U)    // bits 7-9: atype = BF16
+                             | (1U << 10U)   // bits 10-12: btype = BF16
+                             | ((uint32_t)TILE_N >> 3U << 17U)   // bits 17-22: N >> 3
+                             | ((uint32_t)TILE_M >> 4U << 24U);  // bits 24-28: M >> 4
+
+    // Helper for SMEM descriptor encoding
+    auto desc_encode = [](uint32_t x) -> uint64_t {
+        return (x & 0x3FFFF) >> 4;
+    };
+    constexpr uint32_t SBO = 8 * 128;  // 1024 bytes (stride for 128B swizzle pattern)
+    auto make_desc = [&](uint32_t addr) -> uint64_t {
+        return desc_encode(addr)              // bits 0-13: encoded address
+             | (desc_encode(SBO) << 32)       // bits 32-45: encoded SBO
+             | (1ULL << 46)                   // bits 46-48: fixed 0b001
+             | (2ULL << 61);                  // bits 61-63: 128B swizzle
+    };
+
+    constexpr int MMA_K = 16;  // Process 16 K elements per MMA
+
+    // Helper function to wait on an mbarrier with given phase
+    // Uses .acquire semantics for proper memory ordering (from example kernel)
+    auto mbarrier_wait = [](uint32_t mbar_addr, uint32_t wait_phase) {
+        uint32_t ticks = 0x989680;  // timeout ticks (optional)
+        asm volatile(
+            "{\n\t"
+            ".reg .pred P1;\n\t"
+            "LAB_WAIT_%=:\n\t"
+            "mbarrier.try_wait.parity.acquire.cta.shared::cta.b64 P1, [%0], %1, %2;\n\t"
+            "@P1 bra.uni DONE_%=;\n\t"
+            "bra.uni LAB_WAIT_%=;\n\t"
+            "DONE_%=:\n\t"
+            "}"
+            :: "r"(mbar_addr), "r"(wait_phase), "r"(ticks)
+        );
+    };
+
     // each block processes multiple output tiles
-    // note that blockIdx.x  goes from 1 to 148
-    // block 0 would process tiles 0, 148, 296, etc. and then block 1 would process 1, 149, etc. since we're striding by gridDim = 148
     for (int tile_id = blockIdx.x; tile_id < total_tiles; tile_id += gridDim.x) {
 
         int tile_row = tile_id / num_tiles_n;
         int tile_col = tile_id % num_tiles_n;
 
-        // Note the following 2 if statements run in parallel :D
-        // TMEM zeroing is handled by using scale_d=0 on first WGMMA iteration
+        // Reset phase for each new tile
+        phase = 0;
 
-        // 1 thread of the producer loads the first tiles
-        // Prefetch PIPE_DEPTH - 1 tiles, leaving one slot free for the main loop
+        // ============================================================================
+        // PIPELINED MAINLOOP: TMA and MMA run as separate warps with independent loops
+        //
+        // Key insight from example kernel:
+        // - Warp 0 (TMA): loads data, waits on mma_mbar[stage] before reusing slot
+        // - Warp 1 (MMA): computes, waits on tma_mbar[stage] before using data
+        // - MMA warp NEVER waits on its own completion - just issues and moves on
+        // - Only final mainloop_mbar wait before epilogue
+        // ============================================================================
 
-        if (wg_id == 1 && threadIdx.x == 128) {  
-            int prefetch_count = min(PIPE_DEPTH - 1, num_k_tiles); 
-            for (int k_tile = 0; k_tile < prefetch_count; k_tile++) {
-                int slot = k_tile % PIPE_DEPTH;
-                launch_tma_load(  // loads A and B
-                    slot, k_tile, tile_row, tile_col,
-                    a_smem, b_smem,
-                    &inputs_arrived_storage[slot],  
-                    &tensor_map_A, &tensor_map_B
-                );
-            }
-        }
+        if (warp_id == 0 && threadIdx.x == 0) {
+            // ========== TMA WARP ==========
+            // Runs independent loop issuing TMA loads
+            // Waits on mma_mbar[stage] before reusing slot (producer-side wait)
 
-        __syncthreads();
+            for (int iter_k = 0; iter_k < num_k_tiles; iter_k++) {
+                int stage_id = iter_k % PIPE_DEPTH;
+                uint32_t mma_stage_addr = mma_mbar_base + stage_id * 8;
+                uint32_t tma_stage_addr = tma_mbar_base + stage_id * 8;
 
-        // we split up the tiles of  A and B into further tiles
-        // note that each tile of A is 128 x 64 and each tile of B is 64 x 256, where K = 64 (we just set that lol)
-        for (int k_tile = 0; k_tile < num_k_tiles; k_tile++) { // i think we have like 32 k tiles for 1024 x 1024
-            int compute_slot = k_tile % PIPE_DEPTH; // which slot is the tile were computing on is in
-            // With PIPE_DEPTH-1 prefetch, we've loaded tiles 0..(PIPE_DEPTH-2)
-            // At k_tile=0, load tile (PIPE_DEPTH-1) which fills the last empty slot
-            int load_k_tile = k_tile + (PIPE_DEPTH - 1); // which one to load for the producer
-            int load_slot = load_k_tile % PIPE_DEPTH; // which slot to load it into
-
-            // Consumer warpgroup waits for data, but ONLY ONE THREAD issues tcgen05.mma
-            // tcgen05.mma is NOT warpgroup-collective like WGMMA - only 1 thread executes it!
-            if (wg_id == 0) {
-                // Thread 0 waits for TMA data to arrive (producer signals via expect_tx)
-                // Consumer does NOT arrive - only waits! The barrier is signaled by:
-                //   1. Producer's mbarrier.arrive.expect_tx
-                //   2. TMA hardware completion
-                if (threadIdx.x == 0) {
-                    uint64_t* barrier_ptr = &inputs_arrived_storage[compute_slot];
-                    uint32_t barrier_addr = static_cast<uint32_t>(__cvta_generic_to_shared(barrier_ptr));
-
-                    //  phase bit alternates
-                    uint32_t phase = (k_tile / PIPE_DEPTH) & 1;
-
-                    // wait for TMA completion
-                    asm volatile(
-                        "{\n\t"
-                        ".reg .pred p;\n\t"
-                        "WAIT_LOOP:\n\t"
-                        "mbarrier.try_wait.parity.shared::cta.b64 p, [%0], %1;\n\t"
-                        "@!p bra WAIT_LOOP;\n\t"
-                        "}"
-                        :: "r"(barrier_addr), "r"(phase) : "memory"
-                    );
-                }
-                __syncwarp();  // Ensure all threads in warp 0 know data is ready
-
-                // only one thread is needed
-                if (threadIdx.x == 0) {
-                    // Fence before tcgen05 operations to ensure memory ordering
-                    asm volatile("tcgen05.fence::before_thread_sync;");
-
-                    // Get shared memory addresses for current slot
-                    uint32_t a_addr = __cvta_generic_to_shared(a_smem[compute_slot]);
-                    uint32_t b_addr = __cvta_generic_to_shared(b_smem[compute_slot]);
-
-                    // build instruction descriptor
-                    uint32_t idesc = 0;
-                    idesc |= (1 << 4);    // bits 4-5: dtype = F32
-                    idesc |= (1 << 7);    // bits 7-9: atype = BF16
-                    idesc |= (1 << 10);   // bits 10-12: btype = BF16
-                    idesc |= (32 << 17);  // bits 17-22: N >> 3 = 256 >> 3 = 32
-                    idesc |= (8 << 24);   // bits 24-28: M >> 4 = 128 >> 4 = 8
-
-                   
-
-                    // Helper lambda for descriptor encoding
-                    auto desc_encode = [](uint32_t x) -> uint64_t {
-                        return (x & 0x3FFFF) >> 4;
-                    };
-
-                    // SBO = 8 * 128 = 1024 bytes (stride for 128B swizzle pattern)
-                    // This is the stride to the next swizzle block
-                    constexpr uint32_t SBO = 8 * 128;  // 1024 bytes
-
-                    // Make SMEM descriptor with 128B swizzle  
-                    auto make_desc = [&](uint32_t addr) -> uint64_t {
-                        return desc_encode(addr)              // bits 0-13: encoded address
-                             | (desc_encode(SBO) << 32)       // bits 32-45: encoded SBO
-                             | (1ULL << 46)                   // bits 46-48: fixed 0b001
-                             | (2ULL << 61);                  // bits 61-63: 128B swizzle
-                    };
-
-                    // tcgen05.mma 
-                    constexpr int MMA_K = 16;
-
-                    #pragma unroll
-                    for (int k2 = 0; k2 < TILE_K / MMA_K; k2++) {
-                        // Each k2 iteration processes 16 K elements (32 bytes)
-                        uint64_t a_desc = make_desc(a_addr + k2 * 32);
-                        uint64_t b_desc = make_desc(b_addr + k2 * 32);
-
-                        // First iteration zeros accumulator, the rest accumulate
-                        if (k_tile == 0 && k2 == 0) {
-                            // D = A*B (enable_d = false, no accumulation)
-                            asm volatile(
-                                "{\n\t"
-                                ".reg .pred p;\n\t"
-                                "setp.eq.u32 p, 0, 1;\n\t"  // p = false
-                                "tcgen05.mma.cta_group::1.kind::f16 [%0], %1, %2, %3, {%4, %4, %4, %4}, p;\n\t"
-                                "}"
-                                :
-                                : "r"(tmem_base[0]), "l"(a_desc), "l"(b_desc), "r"(idesc), "r"(0)
-                                : "memory"
-                            );
-                        } else {
-                            // D = A*B + D (enable_d = true, accumulate)
-                            asm volatile(
-                                "{\n\t"
-                                ".reg .pred p;\n\t"
-                                "setp.eq.u32 p, 1, 1;\n\t"  // p = true
-                                "tcgen05.mma.cta_group::1.kind::f16 [%0], %1, %2, %3, {%4, %4, %4, %4}, p;\n\t"
-                                "}"
-                                :
-                                : "r"(tmem_base[0]), "l"(a_desc), "l"(b_desc), "r"(idesc), "r"(0)
-                                : "memory"
-                            );
-                        }
-                    }
-
-                    // ASYNC MMA COMPLETION: tcgen05.commit signals mbarrier when MMA finishes
-                    // This is NON-BLOCKING - thread continues immediately, hardware signals later
-                    asm volatile(
-                        "tcgen05.commit.cta_group::1.mbarrier::arrive::one.shared::cluster.b64 [%0];"
-                        :: "r"(mma_mbar_addr) : "memory"
-                    );
+                // Wait for MMA to finish with this stage before reusing
+                // Initial phase is 0 and available, so we wait for phase^1 on first cycle
+                // This trick: on first iteration (iter_k < PIPE_DEPTH), mma_mbar is untouched
+                // so we skip wait. After PIPE_DEPTH iterations, we must wait.
+                if (iter_k >= PIPE_DEPTH) {
+                    mbarrier_wait(mma_stage_addr, phase ^ 1);
                 }
 
-                // All consumer threads sync before signaling completion
-                __syncwarp();
-
-                // Consumer tells producer that it's done with this slot (PTX arrive)
-                if (threadIdx.x == 0) {
-                    uint64_t* barrier_ptr = &inputs_finished_storage[compute_slot];
-                    uint32_t barrier_addr = static_cast<uint32_t>(__cvta_generic_to_shared(barrier_ptr));
-                    asm volatile(
-                        "mbarrier.arrive.release.cta.shared::cta.b64 _, [%0];"
-                        :: "r"(barrier_addr) : "memory"
-                    );
-                }
-            }
-
-            // Producer loads the next tile (runs in parallel with consumer's WGMMA!)
-            if (wg_id == 1 && threadIdx.x == 128 && load_k_tile < num_k_tiles) {
-               
-                if (load_k_tile >= PIPE_DEPTH) {
-                    uint64_t* barrier_ptr = &inputs_finished_storage[load_slot];
-                    uint32_t barrier_addr = static_cast<uint32_t>(__cvta_generic_to_shared(barrier_ptr));
-
-                  
-                    uint32_t phase = ((k_tile - 1) / PIPE_DEPTH) & 1;
-
-                    // Producer only waits - consumer signals via arrive
-                    asm volatile(
-                        "{\n\t"
-                        ".reg .pred p;\n\t"
-                        "WAIT_LOOP2:\n\t"
-                        "mbarrier.try_wait.parity.shared::cta.b64 p, [%0], %1;\n\t"
-                        "@!p bra WAIT_LOOP2;\n\t"
-                        "}"
-                        :: "r"(barrier_addr), "r"(phase) : "memory"
-                    );
+                // Flip phase when we cycle through all buffers
+                if (stage_id == PIPE_DEPTH - 1) {
+                    phase ^= 1;
                 }
 
-                launch_tma_load(
-                    load_slot, load_k_tile, tile_row, tile_col,
-                    a_smem, b_smem,
-                    &inputs_arrived_storage[load_slot],  // raw mbarrier storage
-                    &tensor_map_A, &tensor_map_B
-                );
-            }
+                // Issue TMA loads with expect_tx
+                uint32_t bytes_A = TILE_M * TILE_K * sizeof(__nv_bfloat16);
+                uint32_t bytes_B = TILE_K * TILE_N * sizeof(__nv_bfloat16);
+                uint32_t expected_bytes = bytes_A + bytes_B;
 
-            if (threadIdx.x == 0) {
+                // Signal barrier with expected transaction bytes
                 asm volatile(
-                    "{\n\t"
-                    ".reg .pred p;\n\t"
-                    "MMA_WAIT_LOOP:\n\t"
-                    "mbarrier.try_wait.parity.shared::cta.b64 p, [%0], %1;\n\t"
-                    "@!p bra MMA_WAIT_LOOP;\n\t"
-                    "}"
-                    :: "r"(mma_mbar_addr), "r"(mma_phase) : "memory"
+                    "mbarrier.arrive.expect_tx.release.cta.shared::cta.b64 _, [%0], %1;"
+                    :: "r"(tma_stage_addr), "r"(expected_bytes) : "memory"
+                );
+
+                // TMA coordinates
+                int a_coord_0 = 0;
+                int a_coord_1 = tile_row * TILE_M;
+                int a_coord_2 = iter_k;
+                int b_coord_0 = 0;
+                int b_coord_1 = tile_col * TILE_N;
+                int b_coord_2 = iter_k;
+
+                // TMA A
+                asm volatile(
+                    "cp.async.bulk.tensor.3d.shared::cta.global.tile.mbarrier::complete_tx::bytes"
+                    " [%0], [%1, {%2, %3, %4}], [%5];"
+                    :: "r"((uint32_t)__cvta_generic_to_shared(a_smem[stage_id])),
+                       "l"(&tensor_map_A),
+                       "r"(a_coord_0), "r"(a_coord_1), "r"(a_coord_2),
+                       "r"(tma_stage_addr)
+                    : "memory"
+                );
+
+                // TMA B
+                asm volatile(
+                    "cp.async.bulk.tensor.3d.shared::cta.global.tile.mbarrier::complete_tx::bytes"
+                    " [%0], [%1, {%2, %3, %4}], [%5];"
+                    :: "r"((uint32_t)__cvta_generic_to_shared(b_smem[stage_id])),
+                       "l"(&tensor_map_B),
+                       "r"(b_coord_0), "r"(b_coord_1), "r"(b_coord_2),
+                       "r"(tma_stage_addr)
+                    : "memory"
                 );
             }
-            mma_phase ^= 1;  // flip phase
         }
-        asm volatile("tcgen05.fence::after_thread_sync;");
+        else if (warp_id == 1 && threadIdx.x == 32) {
+            // ========== MMA WARP ==========
+            // Runs independent loop issuing tcgen05.mma
+            // Waits on tma_mbar[stage] before computing (consumer-side wait)
+            // NEVER waits on its own mma_mbar - just issues and continues!
 
-      
+            for (int iter_k = 0; iter_k < num_k_tiles; iter_k++) {
+                int stage_id = iter_k % PIPE_DEPTH;
+                uint32_t tma_stage_addr = tma_mbar_base + stage_id * 8;
+                uint32_t mma_stage_addr = mma_mbar_base + stage_id * 8;
+
+                // Wait for TMA to complete loading this stage
+                mbarrier_wait(tma_stage_addr, phase);
+                asm volatile("tcgen05.fence::after_thread_sync;");
+
+                // Flip phase when we cycle through all buffers
+                if (stage_id == PIPE_DEPTH - 1) {
+                    phase ^= 1;
+                }
+
+                // Get shared memory addresses for current stage
+                uint32_t a_addr = __cvta_generic_to_shared(a_smem[stage_id]);
+                uint32_t b_addr = __cvta_generic_to_shared(b_smem[stage_id]);
+
+                // Issue MMAs for this k_tile (unroll the inner k2 loop)
+                // First MMA of first iter_k: disable accumulation (zero out D)
+                {
+                    uint64_t a_desc = make_desc(a_addr);
+                    uint64_t b_desc = make_desc(b_addr);
+                    if (iter_k == 0) {
+                        // D = A*B (enable_d = false)
+                        asm volatile(
+                            "{\n\t"
+                            ".reg .pred p;\n\t"
+                            "setp.eq.u32 p, 0, 1;\n\t"
+                            "tcgen05.mma.cta_group::1.kind::f16 [%0], %1, %2, %3, {%4, %4, %4, %4}, p;\n\t"
+                            "}"
+                            :: "r"(tmem_base[0]), "l"(a_desc), "l"(b_desc), "r"(idesc), "r"(0)
+                            : "memory"
+                        );
+                    } else {
+                        // D = A*B + D (enable_d = true)
+                        asm volatile(
+                            "{\n\t"
+                            ".reg .pred p;\n\t"
+                            "setp.eq.u32 p, 1, 1;\n\t"
+                            "tcgen05.mma.cta_group::1.kind::f16 [%0], %1, %2, %3, {%4, %4, %4, %4}, p;\n\t"
+                            "}"
+                            :: "r"(tmem_base[0]), "l"(a_desc), "l"(b_desc), "r"(idesc), "r"(0)
+                            : "memory"
+                        );
+                    }
+                }
+
+                // Remaining k2 iterations (always accumulate)
+                #pragma unroll
+                for (int k2 = 1; k2 < TILE_K / MMA_K; k2++) {
+                    uint64_t a_desc = make_desc(a_addr + k2 * 32);
+                    uint64_t b_desc = make_desc(b_addr + k2 * 32);
+                    asm volatile(
+                        "{\n\t"
+                        ".reg .pred p;\n\t"
+                        "setp.eq.u32 p, 1, 1;\n\t"
+                        "tcgen05.mma.cta_group::1.kind::f16 [%0], %1, %2, %3, {%4, %4, %4, %4}, p;\n\t"
+                        "}"
+                        :: "r"(tmem_base[0]), "l"(a_desc), "l"(b_desc), "r"(idesc), "r"(0)
+                        : "memory"
+                    );
+                }
+
+                // Commit MMA completion to this stage's mbarrier (NON-BLOCKING!)
+                // This allows TMA warp to know when it's safe to reuse this stage
+                asm volatile(
+                    "tcgen05.commit.cta_group::1.mbarrier::arrive::one.shared::cluster.b64 [%0];"
+                    :: "r"(mma_stage_addr) : "memory"
+                );
+            }
+
+            // Signal mainloop completion for epilogue
+            asm volatile(
+                "tcgen05.commit.cta_group::1.mbarrier::arrive::one.shared::cluster.b64 [%0];"
+                :: "r"(mainloop_mbar_addr) : "memory"
+            );
+        }
+
+        // All warps sync here, then wait for mainloop to complete before epilogue
         __syncthreads();
+
+        // Wait for all MMA operations to complete before reading TMEM
+        if (threadIdx.x == 0) {
+            mbarrier_wait(mainloop_mbar_addr, mainloop_phase);
+        }
+        __syncthreads();
+        mainloop_phase ^= 1;  // Flip phase for next tile
+
+        // Fence before tcgen05.ld as per PTX docs
+        asm volatile("tcgen05.fence::after_thread_sync;");
 
         // epilogue
 
@@ -484,9 +435,6 @@ __global__ __cluster_dims__(1, 1, 1) void my_matmul_kernel(
             }
             __syncthreads();
         }
-
-    
-        __syncthreads();
     }
 
     checkpoint(checkpoint_buffer, 5);  
