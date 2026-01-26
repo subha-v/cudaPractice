@@ -8,22 +8,6 @@
 #include <cmath>
 #include <omp.h>
 
-// debug
-__device__ __forceinline__ void dassert(bool condition) {
-    if (!condition) {
-        asm volatile("trap;");
-    }
-}
-
-//debug
-#define NUM_CHECKPOINTS 16
-__device__ __forceinline__ void checkpoint(int* buffer, int checkpoint_id) {
-    if (threadIdx.x == 0) {
-        buffer[blockIdx.x * NUM_CHECKPOINTS + checkpoint_id] = 1;
-    }
-}
-
-
 #define CUDA_CHECK(x) do {                                              \
     cudaError_t err = (x);                                              \
     if (err != cudaSuccess) {                                           \
@@ -65,13 +49,8 @@ __global__ __cluster_dims__(1, 1, 1) void my_matmul_kernel(
     const __grid_constant__ CUtensorMap tensor_map_A,
     const __grid_constant__ CUtensorMap tensor_map_B,
     __nv_bfloat16* __restrict__ C,
-    int M, int N, int K,
-    int* checkpoint_buffer   
+    int M, int N, int K
 ) {
-    
-
-    checkpoint(checkpoint_buffer, 0);  
-
     // what thread am i? producer or consumer and which warp am i in
     int warp_id = threadIdx.x / 32;        // Which warp (0-7 for 256 threads)
     int wg_id = warp_id / 4;               // Which warpgroup (0=consumer, 1=producer)
@@ -110,14 +89,6 @@ __global__ __cluster_dims__(1, 1, 1) void my_matmul_kernel(
     }
     __syncthreads();  // Ensure barriers are initialized before TMEM alloc
 
-    checkpoint(checkpoint_buffer, 1);  
-
-   
-    // Only ONE warp (32 threads) should execute it, not a warpgroup!
-
-    checkpoint(checkpoint_buffer, 2);  
-    __syncthreads();
-
     uint32_t num_cols = TMEM_COLS;
 
     // use warp 1 like the example ig
@@ -130,8 +101,6 @@ __global__ __cluster_dims__(1, 1, 1) void my_matmul_kernel(
         );
     }
     __syncthreads();  // ensure everyone got tmem base
-
-    checkpoint(checkpoint_buffer, 3);   
 
     int num_tiles_m = M / TILE_M;
     int num_tiles_n = N / TILE_N;
@@ -146,9 +115,6 @@ __global__ __cluster_dims__(1, 1, 1) void my_matmul_kernel(
     // Phase tracking - alternates 0/1 as we cycle through stages
     int phase = 0;
     int mainloop_phase = 0;  // Tracks mainloop barrier phase across tiles
-
-
-    checkpoint(checkpoint_buffer, 4);   
 
     // Build instruction descriptor once (constant across all tiles)
     constexpr uint32_t idesc = (1U << 4U)    // bits 4-5: dtype = F32
@@ -437,26 +403,17 @@ __global__ __cluster_dims__(1, 1, 1) void my_matmul_kernel(
         }
     }
 
-    checkpoint(checkpoint_buffer, 5);  
-
     // deallocate tmem - tcgen05.dealloc with cta_group::1 needs only ONE warp
     __syncthreads();  // Ensure all threads are done before dealloc
 
-    checkpoint(checkpoint_buffer, 6);  // CHECKPOINT 6: Before TMEM dealloc
-
-    uint32_t dealloc_num_cols = TMEM_COLS;
-    // Use warp 1 (threads 32-63) for dealloc - same warp that did alloc
-    // Per PTX docs: "When .cta_group::1 is specified, one warp from the CTA must perform the allocation and de-allocation"
     if (threadIdx.x >= 32 && threadIdx.x < 64) {  // warp 1
         asm volatile(
             "tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, %1;"
             :
-            : "r"(tmem_base[0]), "r"(dealloc_num_cols)
+            : "r"(tmem_base[0]), "r"(TMEM_COLS)
             : "memory"
         );
     }
-
-    checkpoint(checkpoint_buffer, 7);  
 }
 
 
@@ -525,24 +482,6 @@ void cpu_gemm(float* a, float* b, float* c, int M, int N, int K) {
     }
 }
 
-// Helper function to print checkpoint results
-void print_checkpoint_results(int* h_checkpoints, int num_blocks, const char* checkpoint_names[]) {
-    std::cout << "\n=== CHECKPOINT RESULTS ===" << std::endl;
-    for (int cp = 0; cp < NUM_CHECKPOINTS; cp++) {
-        int reached_count = 0;
-        for (int b = 0; b < num_blocks; b++) {
-            if (h_checkpoints[b * NUM_CHECKPOINTS + cp]) {
-                reached_count++;
-            }
-        }
-        if (checkpoint_names[cp]) {
-            std::cout << "  Checkpoint " << cp << " (" << checkpoint_names[cp] << "): "
-                      << reached_count << "/" << num_blocks << " blocks" << std::endl;
-        }
-    }
-    std::cout << "==========================\n" << std::endl;
-}
-
 // benchmark
 int run_benchmark(size_t M, size_t N, size_t K) {
     // Initialize CUDA driver API (required for TMA)
@@ -557,25 +496,6 @@ int run_benchmark(size_t M, size_t N, size_t K) {
     int NUM_BLOCKS = min(num_tiles, 148);  // Use up to 148 blocks (one per SM)
     dim3 grid(NUM_BLOCKS, 1);
     dim3 block(NUM_THREADS);        // 256 threads per block (2 warpgroups)
-
-    // Checkpoint names for debugging
-    const char* checkpoint_names[NUM_CHECKPOINTS] = {
-        "kernel entry",           // 0
-        "after barrier init",     // 1
-        "before TMEM alloc",      // 2
-        "after TMEM alloc",       // 3
-        "entering tile loop",     // 4
-        "after tile processing",  // 5
-        "before TMEM dealloc",    // 6
-        "kernel exit",            // 7
-        nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr
-    };
-
-    // Allocate checkpoint buffer (device + host)
-    int* d_checkpoints;
-    int* h_checkpoints = new int[NUM_BLOCKS * NUM_CHECKPOINTS]();
-    CUDA_CHECK(cudaMalloc(&d_checkpoints, NUM_BLOCKS * NUM_CHECKPOINTS * sizeof(int)));
-    CUDA_CHECK(cudaMemset(d_checkpoints, 0, NUM_BLOCKS * NUM_CHECKPOINTS * sizeof(int)));
 
     // Allocate host memory
     float* h_A = new float[M * K];
@@ -638,28 +558,19 @@ int run_benchmark(size_t M, size_t N, size_t K) {
     std::cout << "Created TMA descriptors" << std::endl;
     std::cout << "Launching kernel with grid(" << grid.x << "), block(" << block.x << ")" << std::endl;
 
-    // Reset checkpoint buffer before kernel launch
-    CUDA_CHECK(cudaMemset(d_checkpoints, 0, NUM_BLOCKS * NUM_CHECKPOINTS * sizeof(int)));
-
-    // Warmup/debug run
+    // Warmup run
     std::cout << "Running kernel..." << std::endl;
-    my_matmul_kernel<<<grid, block>>>(tensor_map_A, tensor_map_B, d_C, M, N, K, d_checkpoints);
-    CUDA_CHECK(cudaGetLastError());  // Check for launch errors
-    CUDA_CHECK(cudaDeviceSynchronize());  // Wait and check for execution errors
+    my_matmul_kernel<<<grid, block>>>(tensor_map_A, tensor_map_B, d_C, M, N, K);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaDeviceSynchronize());
 
-    // Copy checkpoint results back to host
-    CUDA_CHECK(cudaMemcpy(h_checkpoints, d_checkpoints, NUM_BLOCKS * NUM_CHECKPOINTS * sizeof(int), cudaMemcpyDeviceToHost));
-
-    // Print checkpoint results
-    print_checkpoint_results(h_checkpoints, NUM_BLOCKS, checkpoint_names);
-
-    // Benchmark runs (only if warmup succeeded)
+    // Benchmark runs
     constexpr int ITERS = 5;
     CUDA_CHECK(cudaDeviceSynchronize());
     auto start = std::chrono::high_resolution_clock::now();
 
     for (int i = 0; i < ITERS; i++) {
-        my_matmul_kernel<<<grid, block>>>(tensor_map_A, tensor_map_B, d_C, M, N, K, d_checkpoints);
+        my_matmul_kernel<<<grid, block>>>(tensor_map_A, tensor_map_B, d_C, M, N, K);
     }
     CUDA_CHECK(cudaDeviceSynchronize());
 
@@ -717,11 +628,9 @@ int run_benchmark(size_t M, size_t N, size_t K) {
     delete[] h_A_bf16;
     delete[] h_B_bf16;
     delete[] h_C_bf16;
-    delete[] h_checkpoints;
     CUDA_CHECK(cudaFree(d_A));
     CUDA_CHECK(cudaFree(d_B));
     CUDA_CHECK(cudaFree(d_C));
-    CUDA_CHECK(cudaFree(d_checkpoints));
 
     std::cout << "Done!\n" << std::endl;
 
