@@ -8,14 +8,14 @@
 Make sure to run it with this command, otherwise it will be so slow.
 `nvcc -O3 -gencode arch=compute_100a,code=sm_100a b200_matmul.cu -o b200_matmul -lcuda -lcudart`
 
-Currently achieves ~1200 TFLOPs on the B200.
+Currently achieves ~1500 TFLOPs on the B200.
 
 ### Optimizations Applied
 - **Pipelined TMA/MMA execution**: TMA and MMA run as separate warps with independent loops
 - **Per-stage MMA barriers**: Uses `mma_mbar[PIPE_DEPTH]` instead of single barrier to allow multiple K-tiles in flight
 - **Producer-side MMA wait**: TMA warp waits on `mma_mbar[stage]` before reusing slot, instead of consumer waiting after every iteration
 - **Mainloop barrier**: Single wait before epilogue instead of synchronizing every K-tile
-- **Removed debug checkpoints**: Cleaned up debugging code for production
+- **Simplified epilogue**: Direct TMEM → global writes with no SMEM staging, single __syncthreads()
 
 ## Matmul Naive
 The slow part is the loads for A and B (e.g. A[row * N + k]) because that accesses the HBM to load that specific element in A
